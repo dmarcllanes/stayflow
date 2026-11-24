@@ -1,0 +1,163 @@
+{
+  "slug": "demo",
+  "property": {
+    "name": "Casa Alon Transient House",
+    "tagline": "Sea-breeze rooms a short walk from the beach",
+    "location": "Brgy. Poblacion, San Juan, La Union",
+    "contact_phone": "0917 000 0000",
+    "contact_email": "stay@example.com",
+    "check_in_time": "14:00",
+    "check_out_time": "12:00",
+    "house_rules": "No smoking indoors. Quiet hours 10PM–7AM. No pets. Extra guest beyond capacity not allowed.",
+    "currency": "PHP",
+    "downpayment_pct": 50,
+    "gcash_name": "J. Dela Cruz",
+    "gcash_number": "0917 000 0000",
+    "bank_name": "BPI",
+    "bank_account_name": "Juan Dela Cruz",
+    "bank_account_number": "0000-0000-00",
+    "about": "Casa Alon is a family-run transient house in the heart of San Juan, La Union — the surf capital of the north. We started with two rooms in our ancestral home and grew into a cozy stay for barkadas, couples and families who want to wake up to the sound of the waves.\n\nWe keep things simple: clean rooms, fast WiFi, a shared kitchen, and hosts who actually live here and know the best spots for sunset, sinigang and surf.",
+    "highlights": [
+      "3-minute walk to the beach",
+      "Family-run, on-site hosts",
+      "Fast fiber WiFi in every room",
+      "Free parking for guests",
+      "Shared kitchen & dining area",
+      "Pet-free, smoke-free rooms"
+    ],
+    "services": [
+      {
+        "title": "Surf lessons",
+        "description": "1.5-hour beginner lesson with a local instructor and board rental.",
+        "price": "₱800 / person",
+        "icon": "sun"
+      },
+      {
+        "title": "Airport & terminal pickup",
+        "description": "Van pickup from the San Fernando bus terminal or LU airport.",
+        "price": "from ₱600",
+        "icon": "truck"
+      },
+      {
+        "title": "Filipino breakfast",
+        "description": "Tapsilog, longsilog or pancakes served on the veranda, 7–10AM.",
+        "price": "₱250 / person",
+        "icon": "cake"
+      },
+      {
+        "title": "Island & falls tours",
+        "description": "Day trips to Tangadan Falls and the grape farms of Bauang.",
+        "price": "from ₱1,200",
+        "icon": "map"
+      },
+      {
+        "title": "Celebration setups",
+        "description": "Birthday or anniversary room decor with cake and flowers.",
+        "price": "from ₱1,500",
+        "icon": "gift"
+      },
+      {
+        "title": "Laundry service",
+        "description": "Same-day wash-dry-fold. Drop off before 10AM.",
+        "price": "₱150 / kg",
+        "icon": "sparkles"
+      }
+    ],
+    "faqs": [
+      {
+        "q": "How do I book a room?",
+        "a": "Send a stay request using the form on this page. The owner checks availability and messages you with downpayment instructions. Your dates are secured once the downpayment is received."
+      },
+      {
+        "q": "Is there parking?",
+        "a": "Yes — free parking for up to 3 cars, first come first served."
+      },
+      {
+        "q": "Can I cancel or change my dates?",
+        "a": "Message us at least 7 days before check-in to move your dates. Downpayments are non-refundable but can be used for a rebooking within 3 months."
+      },
+      {
+        "q": "Do you allow early check-in or late check-out?",
+        "a": "Subject to availability. Ask us on the day and we'll do our best — a small fee may apply."
+      }
+    ],
+    "facebook_url": "https://facebook.com/",
+    "instagram_url": "https://instagram.com/",
+    "messenger_url": "https://m.me/",
+    "gallery": [
+      {
+        "url": "",
+        "caption": "Exterior"
+      },
+      {
+        "url": "",
+        "caption": "Beachfront"
+      },
+      {
+        "url": "",
+        "caption": "Lounge & dining"
+      },
+      {
+        "url": "",
+        "caption": "Bedroom"
+      },
+      {
+        "url": "",
+        "caption": "Sunset view"
+      },
+      {
+        "url": "",
+        "caption": "Shared kitchen"
+      }
+    ]
+  },
+  "rooms": [
+    {
+      "name": "Barkada Loft",
+      "description": "Two-level loft with a balcony facing the sea. Best for groups.",
+      "capacity": 6,
+      "rate_per_night": 4500,
+      "amenities": [
+        "Aircon",
+        "WiFi",
+        "Private bathroom",
+        "Kitchenette",
+        "Balcony"
+      ]
+    },
+    {
+      "name": "Couple's Nook",
+      "description": "Cozy queen-bed room with a garden view.",
+      "capacity": 2,
+      "rate_per_night": 1800,
+      "amenities": [
+        "Aircon",
+        "WiFi",
+        "Hot shower"
+      ]
+    },
+    {
+      "name": "Family Room",
+      "description": "One queen bed and two singles, ground floor near the parking.",
+      "capacity": 4,
+      "rate_per_night": 3200,
+      "amenities": [
+        "Aircon",
+        "WiFi",
+        "Private bathroom",
+        "Free parking"
+      ]
+    },
+    {
+      "name": "Garden Cabin",
+      "description": "Native-style cabin. Currently being renovated.",
+      "capacity": 3,
+      "rate_per_night": 2500,
+      "amenities": [
+        "Fan",
+        "WiFi"
+      ],
+      "status": "maintenance"
+    }
+  ]
+}

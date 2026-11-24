@@ -1,0 +1,10 @@
+[project]
+name = "bookai"
+version = "0.1.0"
+description = "StayFlow — white-label transient & hotel booking with a grounded AI concierge"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=3.57.0",
+    "python-fasthtml>=0.14.30",
+]

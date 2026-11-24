@@ -1,0 +1,35 @@
+# Budget: total container RAM < 150 MB on a 1 GB t2/t3.micro.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - ./data:/app/data
+    expose:
+      - "8000"
+    mem_limit: 110m
+    memswap_limit: 110m
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [app]
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    mem_limit: 40m
+    environment:
+      GOMEMLIMIT: 30MiB
+
+volumes:
+  caddy_data:
+  caddy_config:
