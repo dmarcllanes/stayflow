@@ -28,7 +28,7 @@ from pathlib import Path
 from urllib.parse import quote as urlquote
 
 from fasthtml.common import *  # noqa: F403  (FT components, fast_app, serve, ...)
-from starlette.responses import PlainTextResponse, RedirectResponse, Response
+from starlette.responses import FileResponse, PlainTextResponse, RedirectResponse, Response
 
 
 
@@ -653,7 +653,8 @@ def SectionHead(eyebrow, title, sub=None, center=False, link=None):
 
 
 def safe_url(u: str) -> str:
-    return u if u and u.startswith(("https://", "http://")) else ""
+    """External http(s) links, or photos uploaded to this site (/media/…)."""
+    return u if u and (u.startswith(("https://", "http://")) or db.is_media_url(u)) else ""
 
 
 SITE_JS = """
@@ -1848,8 +1849,24 @@ def sms_href(phone: str) -> str:
 ADMIN_TARGET = dict(hx_target="#admin-main", hx_swap="outerHTML")
 
 
-def booking_card(conn, prop, b, today: str):
-    """One booking as a card (works on phones and desktops). Shows SQL-overlap conflicts inline."""
+def booking_ref(slug: str, bid: int) -> str:
+    """Same reference format guests see (form confirmation, AI agent, status lookup)."""
+    return f"SF-{(slug or 'x').upper()}-{bid}"
+
+
+# Owner-facing status names (the DB keeps its technical values).
+ADMIN_STATUS = {"pending_audit": ("Needs your decision", "amber"), "approved": ("Confirmed", "green"),
+                "rejected": ("Declined", "red"), "cancelled": ("Cancelled", "slate")}
+
+
+def _flag(icon, text, tone):
+    style = {"red": "bg-rose-50 text-rose-700", "amber": "bg-amber-50 text-amber-800",
+             "slate": "bg-stone-100 text-slate-600", "teal": "bg-teal-50 text-teal-800"}[tone]
+    return P(Icon(icon, "mt-0.5 h-3.5 w-3.5 shrink-0"), Span(text), cls=f"flex items-start gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold {style}")
+
+
+def booking_card(conn, prop, b, today: str, slug: str = ""):
+    """One booking as a card (phones and desktops). Explains conflicts and the next step in plain words."""
     st = b["status"]
     pending, approved = st == "pending_audit", st == "approved"
     hard = soft = []
@@ -1860,88 +1877,167 @@ def booking_card(conn, prop, b, today: str):
     expired = pending and b["check_in"] < today
     in_house = approved and b["check_in"] <= today < b["check_out"]
     arriving = approved and b["check_in"] == today
+    finished = approved and b["check_out"] <= today
+    first = b["guest_name"].split()[0] if b["guest_name"].strip() else "this guest"
 
-    def act(label, action, cls, icon=None, confirm=None, disabled=False):
+    def act(label, action, cls, icon=None, confirm=None, disabled=False, title=None):
         return Button(Icon(icon, "h-4 w-4") if icon else None, label, type="button", cls=cls + " !px-4 !py-2",
-                      disabled=disabled, hx_post=f"/admin/bookings/{b['id']}/{action}", hx_confirm=confirm, **ADMIN_TARGET)
+                      disabled=disabled, title=title, hx_post=f"/admin/bookings/{b['id']}/{action}", hx_confirm=confirm, **ADMIN_TARGET)
 
-    actions = []
+    actions, flags = [], []
     if pending:
-        actions += [act("Approve", "approve", BTN_ACCENT, "check", disabled=bool(hard) or expired),
-                    act("Reject", "reject", BTN_DANGER, "x", confirm=f"Reject request #{b['id']} from {b['guest_name']}?")]
-    elif approved:
-        actions += [A(Icon("document", "h-4 w-4"), "Payment slip", href=f"/admin/bookings/{b['id']}/slip", cls=BTN_PRIMARY + " !px-4 !py-2"),
-                    act("Cancel", "cancel", BTN_DANGER, None, confirm=f"Cancel approved stay #{b['id']}? The dates open up again.")]
+        why = "Can't approve: the room is already taken" if hard else "Can't approve: check-in date has passed" if expired else None
+        actions += [act("Decline", "reject", BTN_DANGER, "x",
+                        confirm=f"Decline {b['guest_name']}'s request for {b['room_name']}?"),
+                    act("Approve", "approve", BTN_ACCENT, "check", disabled=bool(why), title=why)]
+    elif approved and not finished:
+        actions += [act("Cancel stay", "cancel", BTN_GHOST, None,
+                        confirm=f"Cancel {b['guest_name']}'s confirmed stay? The dates open up again for other guests."),
+                    A(Icon("document", "h-4 w-4"), "Payment slip", href=f"/admin/bookings/{b['id']}/slip", cls=BTN_PRIMARY + " !px-4 !py-2")]
     elif st == "rejected" and b["check_in"] >= today:
-        actions.append(act("Reopen", "reopen", BTN_GHOST, "undo"))
+        actions.append(act("Move back to requests", "reopen", BTN_GHOST, "undo"))
 
-    flags = []
     if hard:
-        flags.append(P(Icon("x", "h-3.5 w-3.5 shrink-0"), "Clashes with approved " + ", ".join(
-            f"#{c['id']} ({short_date(c['check_in'])} → {short_date(c['check_out'])})" for c in hard),
-            cls="flex items-center gap-1.5 rounded-xl bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700"))
+        flags.append(_flag("x", "Room already taken: " + "; ".join(
+            f"{c['guest_name']}'s confirmed stay {short_date(c['check_in'])} → {short_date(c['check_out'])}" for c in hard)
+            + ". Decline this one or ask the guest for other dates.", "red"))
     if soft:
-        flags.append(P(Icon("sparkles", "h-3.5 w-3.5 shrink-0"), "Overlaps other pending " + ", ".join(f"#{c['id']}" for c in soft)
-                       + " — approving this one will block them.",
-                       cls="flex items-center gap-1.5 rounded-xl bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-800"))
+        names = ", ".join(c["guest_name"] for c in soft)
+        flags.append(_flag("users", f"Same room and dates as {names}'s request. Only one can be approved; "
+                                    f"approving this one blocks the other.", "amber"))
     if expired:
-        flags.append(P(Icon("clock", "h-3.5 w-3.5 shrink-0"), "Check-in date has passed — reject or ask the guest for new dates.",
-                       cls="flex items-center gap-1.5 rounded-xl bg-stone-100 px-3 py-2 text-xs font-semibold text-slate-600"))
+        flags.append(_flag("clock", "The check-in date has passed. Decline it, or ask the guest for new dates.", "slate"))
+    if approved and not finished and not in_house:
+        flags.append(_flag("document", f"Next step: send {first} the payment slip for the "
+                                       f"{money(prop, b['downpayment_amount'])} downpayment.", "teal"))
+    if in_house:
+        flags.append(_flag("home", f"Staying now · checks out {short_date(b['check_out'])} by {prop['check_out_time']}.", "teal"))
 
-    tag = (Badge("In-house", "green") if in_house else Badge("Arrives today", "teal") if arriving
-           else Badge(st.replace("_", " "), STATUS_TONE[st]))
-    contact = Div(A(Icon("phone", "h-3.5 w-3.5"), "Call", href=tel_href(b["guest_phone"]),
-                    cls="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-stone-200"),
-                  A(Icon("chat", "h-3.5 w-3.5"), "Text", href=sms_href(b["guest_phone"]),
-                    cls="inline-flex items-center gap-1 rounded-full bg-stone-100 px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-stone-200"),
-                  cls="flex gap-1.5")
+    label, tone = ("Completed", "slate") if finished else ADMIN_STATUS.get(st, (st, "slate"))
+    tag = Badge("Staying now", "green") if in_house else Badge("Arrives today", "teal") if arriving else Badge(label, tone)
+    chip = "inline-flex items-center gap-1 rounded-full bg-stone-100 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-stone-200"
+    contact = Div(A(Icon("phone", "h-3.5 w-3.5"), "Call", href=tel_href(b["guest_phone"]), cls=chip),
+                  A(Icon("chat", "h-3.5 w-3.5"), "Text", href=sms_href(b["guest_phone"]), cls=chip), cls="flex gap-1.5")
+    lbl = "text-[11px] font-semibold uppercase tracking-wider text-slate-400"
     return Article(
-        Div(Div(Span(b["guest_name"][:1].upper(), cls="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-slate-900 font-bold text-white"),
-                Div(P(b["guest_name"], cls="truncate font-bold text-slate-900"),
-                    P(b["guest_phone"], (" · " + b["guest_email"]) if b["guest_email"] else "", cls="truncate text-xs text-slate-500"),
-                    cls="min-w-0"),
-                cls="flex min-w-0 items-center gap-3"),
-            Div(tag, Span(f"#{b['id']}", cls="text-xs font-semibold text-slate-400"), cls="flex shrink-0 items-center gap-2"),
-            cls="flex items-start justify-between gap-3"),
-        Div(Div(P("Room", cls="text-[11px] font-semibold uppercase tracking-wider text-slate-400"),
-                P(b["room_name"], cls="mt-0.5 text-sm font-bold text-slate-900")),
-            Div(P("Dates", cls="text-[11px] font-semibold uppercase tracking-wider text-slate-400"),
+        Div(tag, Span(booking_ref(slug, b["id"]), title="Booking reference (the guest sees the same one)",
+                      cls="text-[11px] font-semibold text-slate-400"),
+            cls="flex items-center justify-between gap-3"),
+        Div(Span(b["guest_name"][:1].upper(), cls="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-slate-900 font-bold text-white"),
+            Div(P(b["guest_name"], cls="break-words font-bold leading-snug text-slate-900"),
+                P(b["guest_phone"], (" · " + b["guest_email"]) if b["guest_email"] else "", cls="truncate text-xs text-slate-500"),
+                cls="min-w-0"),
+            cls="mt-3 flex min-w-0 items-center gap-3"),
+        Div(Div(P("Room", cls=lbl), P(b["room_name"], cls="mt-0.5 text-sm font-bold text-slate-900")),
+            Div(P("Dates", cls=lbl),
                 P(f"{short_date(b['check_in'])} → {short_date(b['check_out'])}", cls="mt-0.5 text-sm font-bold text-slate-900"),
                 P(f"{b['nights']} night{'s' if b['nights'] != 1 else ''} · {b['guests']} guest{'s' if b['guests'] != 1 else ''}",
                   cls="text-xs text-slate-500")),
-            Div(P("Total", cls="text-[11px] font-semibold uppercase tracking-wider text-slate-400"),
+            Div(P("Total", cls=lbl),
                 P(money(prop, b["total_amount"]), cls="mt-0.5 text-sm font-bold text-slate-900"),
-                P(f"Down {money(prop, b['downpayment_amount'])}", cls="text-xs text-slate-500")),
+                P(f"Downpayment {money(prop, b['downpayment_amount'])}", cls="text-xs text-slate-500")),
             cls="mt-4 grid grid-cols-2 gap-3 rounded-2xl bg-stone-50 p-3.5 sm:grid-cols-3"),
-        P(Icon("chat", "mr-1.5 inline h-3.5 w-3.5"), b["notes"], cls="mt-3 text-sm italic text-slate-600") if b["notes"] else None,
+        P(Icon("chat", "mr-1.5 inline h-3.5 w-3.5"), "“", b["notes"], "”", cls="mt-3 text-sm italic text-slate-600") if b["notes"] else None,
         Div(*flags, cls="mt-3 space-y-2") if flags else None,
         Div(contact, Div(*actions, cls="flex flex-wrap justify-end gap-2") if actions else None,
-            cls="mt-4 flex flex-wrap items-center justify-between gap-3"),
+            cls="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-stone-100 pt-4"),
         id=f"booking-{b['id']}",
-        cls="rounded-[1.5rem] bg-white p-4 ring-1 ring-stone-200/70 sm:p-5" + (" opacity-70" if expired else ""),
+        cls="rounded-[1.5rem] bg-white p-4 ring-1 sm:p-5 " + ("ring-rose-200" if hard else "ring-stone-200/70")
+            + (" opacity-70" if expired else ""),
     )
 
 
-def admin_section(icon, title, sub, *content, count=None, id=None, tone=0, extra=None):
+def admin_section(icon, title, sub, *content, count=None, id=None, tone=0, extra=None, grid=False):
     return Section(
         Div(Div(IconTile(icon, tone, "h-10 w-10", "h-5 w-5"),
-                Div(H2(title, Span(str(count), cls="ml-2 rounded-full bg-stone-100 px-2 py-0.5 align-middle text-xs font-bold text-slate-600")
-                       if count is not None else None, cls="text-lg font-extrabold tracking-tight"),
-                    P(sub, cls="text-xs text-slate-500") if sub else None),
+                Div(H2(title, cls="text-lg font-extrabold tracking-tight"), P(sub, cls="text-xs text-slate-500") if sub else None),
                 cls="flex items-center gap-3"),
             extra, cls="flex flex-wrap items-center justify-between gap-3"),
-        Div(*content, cls="mt-4 space-y-3"),
-        id=id, cls="scroll-mt-28 rounded-[2rem] bg-white/60 p-4 ring-1 ring-stone-200/70 sm:p-6",
+        Div(*content, cls="mt-4 " + ("grid grid-cols-1 items-start gap-3 lg:grid-cols-2 [&>*]:min-w-0" if grid else "space-y-3")),
+        id=id, cls="rounded-[2rem] bg-white/60 p-4 ring-1 ring-stone-200/70 sm:p-6",
     )
 
 
-def empty_state(icon, text):
+def empty_state(icon, text, sub=None):
     return Div(Span(Icon(icon, "h-6 w-6"), cls="grid h-12 w-12 place-items-center rounded-full bg-stone-100 text-slate-400"),
-               P(text, cls="mt-3 text-sm font-medium text-slate-500"),
-               cls="flex flex-col items-center rounded-[1.5rem] border-2 border-dashed border-stone-200 py-10 text-center")
+               P(text, cls="mt-3 text-sm font-semibold text-slate-600"),
+               P(sub, cls="mt-1 max-w-sm text-xs text-slate-400") if sub else None,
+               cls="col-span-full flex flex-col items-center rounded-[1.5rem] border-2 border-dashed border-stone-200 px-4 py-10 text-center")
 
 
 ROOM_STATUS_LABEL = {"available": "Available", "maintenance": "Maintenance", "hidden": "Hidden"}
+ROOM_STATUS_HELP = {"available": "Available: guests can book", "maintenance": "Maintenance: shown, can't book",
+                    "hidden": "Hidden: not on website"}
+
+
+PHOTO_JS = """
+function sfPhotoBox(el){ return el.closest('[data-photo-field]'); }
+function sfPhotoShow(box, src){
+  const img=box.querySelector('img'), ph=box.querySelector('[data-photo-empty]');
+  img.src=src||''; img.hidden=!src; ph.hidden=!!src; box.querySelector('[data-photo-remove]').hidden=!src;
+}
+async function sfPhotoPick(inp){
+  const f=inp.files&&inp.files[0], box=sfPhotoBox(inp); if(!f) return;
+  let out=f;
+  // Shrink big phone photos in the browser (max 1600px JPEG) so uploads are quick and small.
+  if(f.type!=='image/gif' && f.size>500*1024 && window.createImageBitmap){
+    try{
+      const bmp=await createImageBitmap(f,{imageOrientation:'from-image'});
+      const k=Math.min(1,1600/Math.max(bmp.width,bmp.height));
+      const c=document.createElement('canvas'); c.width=Math.round(bmp.width*k); c.height=Math.round(bmp.height*k);
+      c.getContext('2d').drawImage(bmp,0,0,c.width,c.height);
+      const blob=await new Promise(r=>c.toBlob(r,'image/jpeg',0.82));
+      if(blob && blob.size<f.size){
+        out=new File([blob], f.name.replace(/\\.[^.]+$/,'')+'.jpg', {type:'image/jpeg'});
+        const dt=new DataTransfer(); dt.items.add(out); inp.files=dt.files;
+      }
+    }catch(e){}
+  }
+  if(out.size>8*1024*1024){ inp.value=''; if(window.sfToast) sfToast('That photo is too big (max 8 MB).'); return; }
+  sfPhotoShow(box, URL.createObjectURL(out));
+  box.querySelector('[data-photo-note]').textContent='New photo selected. Save to upload it.';
+  box.querySelector('input[name=image_link]').value='';
+}
+function sfPhotoLink(inp){
+  const box=sfPhotoBox(inp), v=inp.value.trim();
+  if(/^https?:\\/\\//.test(v)){ box.querySelector('input[type=file]').value=''; sfPhotoShow(box, v);
+    box.querySelector('[data-photo-note]').textContent='Using the photo link. Save to apply.'; }
+}
+function sfPhotoClear(btn){
+  const box=sfPhotoBox(btn);
+  box.querySelector('input[type=file]').value=''; box.querySelector('input[name=image_link]').value='';
+  box.querySelector('input[name=image_url]').value=''; sfPhotoShow(box,'');
+  box.querySelector('[data-photo-note]').textContent='Photo removed. Save to apply (a sample photo shows until you add one).';
+}
+"""
+
+
+def photo_field(url: str = "", label: str = "Room photo"):
+    """Upload-or-link photo picker. Posts image_file (upload), image_link (pasted link) and image_url (current)."""
+    src = safe_url(url)
+    link = url if url and not db.is_media_url(url) else ""
+    return Div(
+        P(label, cls="text-xs font-semibold text-slate-600"),
+        Div(Div(Img(src=src, alt="", hidden=not src, cls="h-full w-full object-cover"),
+                Span(Icon("camera", "h-7 w-7"), Span("No photo yet", cls="text-[11px] font-semibold"), data_photo_empty="1",
+                     hidden=bool(src), cls="flex flex-col items-center gap-1 text-slate-400"),
+                cls="grid h-28 w-full shrink-0 place-items-center overflow-hidden rounded-2xl bg-stone-100 ring-1 ring-stone-200 sm:w-40"),
+            Div(Div(Label(Icon("camera", "h-4 w-4"), "Upload photo",
+                          Input(type="file", name="image_file", accept="image/jpeg,image/png,image/webp,image/gif",
+                                onchange="sfPhotoPick(this)", cls="sr-only"),
+                          cls=BTN_PRIMARY + " cursor-pointer !px-4 !py-2 focus-within:ring-2 focus-within:ring-teal-400"),
+                    Button(Icon("trash", "h-4 w-4"), "Remove", type="button", onclick="sfPhotoClear(this)", data_photo_remove="1",
+                           hidden=not src, cls=BTN_GHOST + " !px-4 !py-2"),
+                    cls="flex flex-wrap gap-2"),
+                P("From your phone or computer: JPG, PNG or WebP. Big photos are shrunk automatically.", data_photo_note="1",
+                  cls="mt-2 text-[11px] text-slate-500"),
+                Input(name="image_link", value=link, type="url", maxlength="500", placeholder="…or paste a photo link (https://…)",
+                      oninput="sfPhotoLink(this)", aria_label="Photo link", cls=INPUT + " mt-2 !min-h-[2.5rem] !py-1.5 text-sm"),
+                cls="min-w-0 flex-1"),
+            cls="mt-1.5 flex flex-col gap-3 sm:flex-row sm:items-start"),
+        Input(type="hidden", name="image_url", value=url or ""),
+        data_photo_field="1",
+    )
 
 
 def room_editor(r, values: dict | None = None, error: str | None = None):
@@ -1949,49 +2045,58 @@ def room_editor(r, values: dict | None = None, error: str | None = None):
     v = {k: r[k] for k in ("name", "rate_per_night", "capacity", "amenities", "description", "image_url", "sort_order")}
     v.update(values or {})
     return Form(
-        Div(Field("Name", Input(name="name", value=v["name"], required=True, maxlength="80", cls=INPUT)),
-            Field("Rate / night", Input(name="rate_per_night", value=str(v["rate_per_night"]), type="number", min="0",
-                                        inputmode="numeric", required=True, cls=INPUT)),
+        Div(Field("Room name", Input(name="name", value=v["name"], required=True, maxlength="80", cls=INPUT)),
+            Field("Price per night", Input(name="rate_per_night", value=str(v["rate_per_night"]), type="number", min="0",
+                                           inputmode="numeric", required=True, cls=INPUT)),
             Field("Max guests", Input(name="capacity", value=str(v["capacity"]), type="number", min="1", max="50", required=True, cls=INPUT)),
-            Field("Display order", Input(name="sort_order", value=str(v["sort_order"]), type="number", cls=INPUT)),
+            Field("Order on website (1 = first)", Input(name="sort_order", value=str(v["sort_order"]), type="number", cls=INPUT)),
             cls="grid grid-cols-2 gap-3"),
-        Field("Amenities (comma-separated)", Input(name="amenities", value=v["amenities"], maxlength="300", cls=INPUT)),
+        Field("Amenities (separate with commas)", Input(name="amenities", value=v["amenities"], maxlength="300",
+                                                        placeholder="Aircon, WiFi, Hot shower", cls=INPUT)),
         Field("Description", Textarea(v["description"], name="description", rows="3", maxlength="1000", cls=INPUT)),
-        Field("Photo URL", Input(name="image_url", value=v["image_url"], type="url", maxlength="500", placeholder="https://…", cls=INPUT)),
+        photo_field(v["image_url"]),
         Input(type="hidden", name="status", value=values.get("status", r["status"]) if values else r["status"]),
         P(error, role="alert", cls="rounded-xl bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700") if error else None,
         Div(Button("Delete room", Icon("trash", "h-4 w-4"), type="button", cls=BTN_DANGER + " !px-4 !py-2",
                    hx_post=f"/admin/rooms/{r['id']}/delete", hx_confirm=f"Delete {r['name']}? This can't be undone.", **ADMIN_TARGET),
-            Button("Save changes", cls=BTN_PRIMARY + " !px-5 !py-2"),
+            Button("Save changes", type="submit", cls=BTN_PRIMARY + " !px-5 !py-2"),
             cls="flex flex-wrap justify-between gap-2"),
         hx_post=f"/admin/rooms/{r['id']}/edit", method="post", action=f"/admin/rooms/{r['id']}/edit", **ADMIN_TARGET,
+        hx_encoding="multipart/form-data", enctype="multipart/form-data", hx_disabled_elt="find button[type=submit]",
         cls="mt-3 space-y-3 border-t border-stone-100 pt-4",
     )
 
 
 def room_card_admin(prop, r, edit_error: str | None = None, edit_values: dict | None = None):
     status_tone = {"available": "bg-emerald-500", "maintenance": "bg-amber-500", "hidden": "bg-slate-400"}[r["status"]]
+    lbl = "mb-1 block text-[11px] font-semibold text-slate-500"
     return Article(
-        Div(Div(room_media(r), cls="h-[6.5rem] w-20 shrink-0 overflow-hidden rounded-2xl bg-stone-200 sm:w-28"),
+        Div(Div(room_media(r), cls="h-24 w-24 shrink-0 overflow-hidden rounded-2xl bg-stone-200 sm:w-28"),
             Div(Div(H3(r["name"], cls="truncate font-bold text-slate-900"),
                     Span(Span(cls=f"mr-1.5 inline-block h-1.5 w-1.5 rounded-full {status_tone}"), ROOM_STATUS_LABEL[r["status"]],
                          cls="inline-flex shrink-0 items-center rounded-full bg-stone-100 px-2 py-0.5 text-[11px] font-bold text-slate-600"),
                     cls="flex items-center justify-between gap-2"),
-                P(f"Up to {r['capacity']} guests · #{r['id']}", cls="text-xs text-slate-500"),
-                # Quick rate + status update
-                Form(Label(Span(prop["currency"] if prop["currency"] != "PHP" else "₱",
-                                cls="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm font-semibold text-slate-400"),
-                           Input(type="number", name="rate_per_night", value=str(r["rate_per_night"]), min="0", step="1", required=True,
-                                 inputmode="numeric", aria_label="Rate per night", cls=INPUT + " !min-h-[2.5rem] !py-1.5 !pl-7"),
-                           cls="relative block w-[6.5rem] shrink-0"),
-                     Select(*[Option(ROOM_STATUS_LABEL[s], value=s, selected=s == r["status"]) for s in db.ROOM_STATUSES],
-                            name="status", aria_label="Status", cls=INPUT + " !min-h-[2.5rem] min-w-0 flex-1 !py-1.5 !pl-3"),
-                     Button("Save", cls=BTN_PRIMARY + " shrink-0 !px-4 !py-2"),
-                     hx_post=f"/admin/rooms/{r['id']}", method="post", action=f"/admin/rooms/{r['id']}", **ADMIN_TARGET,
-                     cls="mt-3 flex items-center gap-2"),
+                P(f"Up to {r['capacity']} guests", cls="text-xs text-slate-500"),
+                P(r["amenities"], cls="mt-1 line-clamp-2 text-xs text-slate-400") if r["amenities"] else None,
                 cls="min-w-0 flex-1"),
             cls="flex gap-3 sm:gap-4"),
-        Details(Summary(Icon("pencil", "h-4 w-4"), "Edit details",
+        # Quick price + status update, labelled so it's obvious what each box does.
+        Form(Div(Label(Span("Price per night", cls=lbl),
+                       Div(Span(prop["currency"] if prop["currency"] != "PHP" else "₱",
+                                cls="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-sm font-semibold text-slate-400"),
+                           Input(type="number", name="rate_per_night", value=str(r["rate_per_night"]), min="0", step="1", required=True,
+                                 inputmode="numeric", cls=INPUT + " !min-h-[2.75rem] !py-1.5 !pl-7"),
+                           cls="relative"),
+                       cls="block w-[7.5rem] shrink-0"),
+                 Label(Span("Status", cls=lbl),
+                       Select(*[Option(ROOM_STATUS_HELP[s], value=s, selected=s == r["status"]) for s in db.ROOM_STATUSES],
+                              name="status", cls=INPUT + " !min-h-[2.75rem] !py-1.5 !pl-3"),
+                       cls="block min-w-0 flex-1"),
+                 cls="flex items-end gap-2"),
+             Button(Icon("check", "h-4 w-4"), "Update price & status", cls=BTN_PRIMARY + " mt-2 w-full !py-2"),
+             hx_post=f"/admin/rooms/{r['id']}", method="post", action=f"/admin/rooms/{r['id']}", **ADMIN_TARGET,
+             cls="mt-4 rounded-2xl bg-stone-50 p-3"),
+        Details(Summary(Icon("pencil", "h-4 w-4"), "Edit name, photo, description…",
                         cls="mt-3 inline-flex cursor-pointer list-none items-center gap-1.5 text-sm font-semibold text-slate-600 hover:text-slate-900 [&::-webkit-details-marker]:hidden"),
                 room_editor(r, edit_values, edit_error), open=bool(edit_error)),
         id=f"room-{r['id']}",
@@ -2005,30 +2110,32 @@ def add_room_form(values: dict | None = None, error: str | None = None):
         Summary(Icon("plus", "h-4 w-4"), "Add a room",
                 cls=BTN_GHOST + " cursor-pointer list-none [&::-webkit-details-marker]:hidden"),
         Form(
-            Div(Field("Name", Input(name="name", value=v.get("name", ""), required=True, maxlength="80", cls=INPUT)),
-                Field("Rate / night", Input(name="rate_per_night", value=v.get("rate_per_night", ""), type="number", min="0",
-                                            inputmode="numeric", required=True, cls=INPUT)),
+            Div(Field("Room name", Input(name="name", value=v.get("name", ""), required=True, maxlength="80", cls=INPUT)),
+                Field("Price per night", Input(name="rate_per_night", value=v.get("rate_per_night", ""), type="number", min="0",
+                                               inputmode="numeric", required=True, cls=INPUT)),
                 Field("Max guests", Input(name="capacity", value=v.get("capacity", "2"), type="number", min="1", max="50", required=True, cls=INPUT)),
-                Field("Amenities (comma-separated)", Input(name="amenities", value=v.get("amenities", ""), maxlength="300", cls=INPUT)),
+                Field("Amenities (separate with commas)", Input(name="amenities", value=v.get("amenities", ""), maxlength="300",
+                                                                placeholder="Aircon, WiFi, Hot shower", cls=INPUT)),
                 cls="grid gap-3 sm:grid-cols-2"),
             Field("Description", Textarea(v.get("description", ""), name="description", rows="2", maxlength="1000", cls=INPUT)),
-            Field("Photo URL (optional)", Input(name="image_url", value=v.get("image_url", ""), type="url", maxlength="500",
-                                                placeholder="https://…", cls=INPUT)),
+            photo_field(v.get("image_url", ""), "Room photo (optional)"),
             P(error, role="alert", cls="rounded-xl bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700") if error else None,
-            Button(Icon("plus", "h-4 w-4"), "Add room", cls=BTN_PRIMARY),
+            Button(Icon("plus", "h-4 w-4"), "Add room", type="submit", cls=BTN_PRIMARY),
             hx_post="/admin/rooms", method="post", action="/admin/rooms", **ADMIN_TARGET,
+            hx_encoding="multipart/form-data", enctype="multipart/form-data", hx_disabled_elt="find button[type=submit]",
             cls="mt-4 space-y-3 rounded-[1.5rem] bg-white p-4 ring-1 ring-stone-200/70",
         ),
         open=bool(error), cls="mt-4",
     )
 
 
-def Stat(label, value, icon, tone, sub=None):
-    return Div(Div(IconTile(icon, tone, "h-10 w-10", "h-5 w-5"), P(label, cls="text-xs font-semibold text-slate-500"),
-                   cls="flex items-center gap-3"),
-               P(str(value), cls="mt-3 text-3xl font-extrabold tracking-tight text-slate-900"),
-               P(sub, cls="text-xs text-slate-400") if sub else None,
-               cls="rounded-[1.5rem] bg-white p-4 ring-1 ring-stone-200/70 sm:p-5")
+def Stat(label, value, icon, tone, sub=None, tab=None):
+    inner = (Div(IconTile(icon, tone, "h-10 w-10", "h-5 w-5"), P(label, cls="text-xs font-semibold leading-tight text-slate-500"),
+                 cls="flex items-center gap-3"),
+             P(str(value), cls="mt-3 text-2xl font-extrabold tracking-tight text-slate-900 sm:text-3xl"),
+             P(sub, cls="text-xs text-slate-400") if sub else None)
+    cls = "block rounded-[1.5rem] bg-white p-4 ring-1 ring-stone-200/70 sm:p-5"
+    return A(*inner, href=f"#{tab}", cls=cls + " transition hover:-translate-y-0.5 hover:ring-slate-300") if tab else Div(*inner, cls=cls)
 
 
 def flash_box(flash):
@@ -2041,7 +2148,63 @@ def flash_box(flash):
                cls=f"sf-bubble flex items-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold shadow-lg {style}")
 
 
-def dashboard_body(conn, prop, flash=None, add_values=None, add_error=None, edit_room=None, edit_values=None, edit_error=None):
+HOW_IT_WORKS = (
+    ("inbox", "A guest sends a request", "From your website or the AI chat. Nothing is booked yet."),
+    ("check", "You approve or decline", "The app blocks approvals that clash with a confirmed stay."),
+    ("document", "Send the payment slip", "Copy it or text it to the guest from the confirmed stay."),
+    ("wallet", "Guest pays the downpayment", "The rest is paid on arrival."),
+)
+
+
+def how_it_works(open_: bool):
+    return Details(
+        Summary(Icon("sparkles", "h-4 w-4 text-teal-600"), "How bookings work",
+                Icon("chevron-down", "ml-auto h-4 w-4 text-slate-400 transition group-open:rotate-180"),
+                cls="flex cursor-pointer list-none items-center gap-2 text-sm font-bold text-slate-700 [&::-webkit-details-marker]:hidden"),
+        Ol(*[Li(Span(str(i), cls="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-slate-900 text-xs font-bold text-white"),
+                Div(P(t, cls="text-sm font-bold text-slate-900"), P(s, cls="text-xs text-slate-500")), cls="flex gap-3")
+             for i, (_, t, s) in enumerate(HOW_IT_WORKS, 1)],
+           cls="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4"),
+        open=open_, cls="group rounded-[1.5rem] bg-white p-4 ring-1 ring-stone-200/70",
+    )
+
+
+ADMIN_TABS_JS = """
+(function(){
+  const m=document.getElementById('admin-main'); if(!m) return;
+  window.sfTab=function(t,keepHash){
+    const main=document.getElementById('admin-main'); if(!main) return;
+    const names=[...main.querySelectorAll('[data-panel]')].map(p=>p.dataset.panel);
+    if(!names.includes(t)) t=names[0];
+    main.querySelectorAll('[data-panel]').forEach(p=>{p.hidden=p.dataset.panel!==t});
+    main.querySelectorAll('[data-tab]').forEach(a=>a.setAttribute('aria-selected', a.dataset.tab===t ? 'true':'false'));
+    if(!keepHash && location.hash.slice(1)!==t) history.replaceState(null,'','#'+t);
+  };
+  if(!window.sfTabBound){
+    window.sfTabBound=true;
+    window.addEventListener('hashchange',()=>{ sfTab(location.hash.slice(1), true); window.scrollTo({top:0,behavior:'smooth'}); });
+  }
+  sfTab(m.dataset.force || location.hash.slice(1) || 'requests');
+})();
+"""
+
+
+def admin_tabs(tabs):
+    """tabs: [(key, label, short_label_for_phones, icon, count, alert)]"""
+    return Nav(*[A(Icon(icon, "hidden h-4 w-4 sm:block"), Span(short, cls="sm:hidden"), Span(label, cls="hidden sm:inline"),
+                   Span(str(n), cls="rounded-full px-1.5 text-[11px] font-bold "
+                        + ("bg-amber-400 text-slate-900" if alert else "bg-stone-200/80 text-slate-600"))
+                   if n is not None else None,
+                   href=f"#{key}", data_tab=key, role="tab", aria_selected="false",
+                   cls="flex min-w-0 items-center justify-center gap-1.5 rounded-full px-2 py-2.5 text-[13px] font-semibold text-slate-600 transition sm:gap-2 sm:px-4 sm:text-sm "
+                       "hover:text-slate-900 aria-selected:bg-slate-900 aria-selected:text-white aria-selected:shadow")
+                 for key, label, short, icon, n, alert in tabs],
+               role="tablist",
+               cls="grid grid-cols-4 gap-1 rounded-full bg-white/85 p-1 ring-1 ring-stone-200/80 backdrop-blur-xl sm:flex")
+
+
+def dashboard_body(conn, prop, flash=None, add_values=None, add_error=None, edit_room=None, edit_values=None, edit_error=None,
+                   slug: str = ""):
     rooms = db.list_rooms(conn, include_hidden=True)
     pending = db.list_bookings(conn, status="pending_audit")
     upcoming = db.list_bookings(conn, status="approved", upcoming_only=True)
@@ -2054,42 +2217,69 @@ def dashboard_body(conn, prop, flash=None, add_values=None, add_error=None, edit
     hour = time.localtime().tm_hour
     greet = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
     clashes = sum(1 for b in pending if db.find_overlaps(conn, b["room_id"], b["check_in"], b["check_out"], exclude_booking_id=b["id"]))
+    card = lambda b: booking_card(conn, prop, b, today, slug)  # noqa: E731
+
+    # One clear "what needs doing" line.
+    todo = []
+    if pending:
+        todo.append(A(Icon("inbox", "h-4 w-4"), f"{len(pending)} request{'s' if len(pending) != 1 else ''} need your decision",
+                      Icon("arrow-right", "h-4 w-4"), href="#requests",
+                      cls="inline-flex items-center gap-2 rounded-full bg-amber-100 px-4 py-2 text-sm font-bold text-amber-900 hover:bg-amber-200"))
+    if arrivals:
+        todo.append(A(Icon("calendar", "h-4 w-4"), f"{len(arrivals)} arriving today", href="#stays",
+                      cls="inline-flex items-center gap-2 rounded-full bg-teal-100 px-4 py-2 text-sm font-bold text-teal-900 hover:bg-teal-200"))
+    if not todo:
+        todo.append(Span(Icon("check", "h-4 w-4"), "You're all caught up, no requests waiting.",
+                         cls="inline-flex items-center gap-2 rounded-full bg-emerald-100 px-4 py-2 text-sm font-bold text-emerald-900"))
+
+    tabs = [("requests", "Requests", "Requests", "inbox", len(pending), bool(pending)),
+            ("stays", "Confirmed stays", "Stays", "calendar", len(upcoming), False),
+            ("rooms", "Rooms & prices", "Rooms", "home", len(rooms), False),
+            ("history", "History", "History", "clock", None, False)]
+    force = "rooms" if (edit_error or add_error) else ""
+
     return Main(
         Div(flash_box(flash), cls="sticky top-20 z-30 mb-4 empty:hidden") if flash else None,
         Div(Div(P(date.today().strftime("%A, %d %B %Y"), cls="text-xs font-semibold uppercase tracking-wider text-slate-400"),
                 H1(f"{greet} 👋", cls="mt-1 text-[1.9rem] font-extrabold tracking-tight sm:text-4xl"),
-                P(f"{len(pending)} request{'s' if len(pending) != 1 else ''} waiting"
-                  + (f" · {len(arrivals)} arriving today" if arrivals else "") + (f" · {clashes} with clashes" if clashes else ""),
-                  cls="mt-1 text-sm text-slate-500")),
-            Div(A(Icon("pencil", "h-4 w-4"), "Edit storefront", href="/admin/storefront", cls=BTN_PRIMARY),
-                A(Icon("arrow-right", "h-4 w-4 -rotate-45"), "View storefront", href="/", target="_blank", cls=BTN_GHOST),
+                Div(*todo, cls="mt-3 flex flex-wrap gap-2")),
+            Div(A(Icon("pencil", "h-4 w-4"), "Edit website", href="/admin/storefront", cls=BTN_PRIMARY),
+                A(Icon("arrow-right", "h-4 w-4 -rotate-45"), "View website", href="/", target="_blank", cls=BTN_GHOST),
                 cls="flex flex-wrap gap-2"),
             cls="flex flex-wrap items-end justify-between gap-4"),
-        Div(Stat("Pending requests", len(pending), "inbox", 1, f"{clashes} clash" + ("es" if clashes != 1 else "") if clashes else "Ready to review"),
-            Stat("Upcoming stays", len(upcoming), "calendar", 0, f"{len(arrivals)} arriving today" if arrivals else None),
-            Stat("In-house now", len(in_house), "home", 5),
-            Stat("Next 7 days", money(prop, next_week_revenue), "wallet", 3, "approved revenue"),
+        Div(Stat("New requests", len(pending), "inbox", 1,
+                 (f"{clashes} can't be approved" if clashes else "Waiting for you") if pending else "None waiting", tab="requests"),
+            Stat("Confirmed stays", len(upcoming), "calendar", 0, f"{len(arrivals)} arriving today" if arrivals else "Coming up", tab="stays"),
+            Stat("Staying now", len(in_house), "home", 5, "Guests checked in"),
+            Stat("Next 7 days", money(prop, next_week_revenue), "wallet", 3, "From confirmed stays"),
             cls="mt-6 grid grid-cols-2 gap-3 lg:grid-cols-4"),
-        Div(
-            Div(admin_section("inbox", "Audit queue", "Approve runs a date-overlap check; clashing requests can't be approved.",
-                              *([booking_card(conn, prop, b, today) for b in pending] or [empty_state("check", "No requests waiting. 🎉")]),
-                              count=len(pending), id="queue", tone=1),
-                admin_section("calendar", "Upcoming stays", "Approved bookings, soonest first.",
-                              *([booking_card(conn, prop, b, today) for b in upcoming] or [empty_state("calendar", "No upcoming stays yet.")]),
-                              count=len(upcoming), id="upcoming", tone=0),
-                admin_section("clock", "Recent history", "Rejected, cancelled and completed stays.",
-                              *([booking_card(conn, prop, b, today) for b in history] or [empty_state("clock", "Nothing here yet.")]),
-                              id="history", tone=3),
-                cls="space-y-6"),
-            Div(admin_section("home", "Rooms & rates", "Hidden rooms are off the storefront; maintenance shows as unavailable.",
-                              Div(*[room_card_admin(prop, r, edit_error if edit_room == r["id"] else None,
-                                                    edit_values if edit_room == r["id"] else None) for r in rooms],
-                                  cls="space-y-3") if rooms else empty_state("home", "No rooms yet — add your first one."),
-                              add_room_form(add_values, add_error),
-                              count=len(rooms), id="rooms", tone=5),
-                cls="space-y-6"),
-            cls="mt-6 grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)] [&>*]:min-w-0"),
-        id="admin-main", hx_get="/admin/body", hx_trigger="sf-admin-refresh from:body", hx_swap="outerHTML",
+        Div(admin_tabs(tabs), cls="sticky top-[4.6rem] z-20 -mx-1 mt-6 px-1 py-2"),
+        # Panels (one visible at a time; the tab bar and stat cards switch them).
+        Div(how_it_works(open_=not upcoming and not history),
+            admin_section("inbox", "Requests waiting for you",
+                          "Nothing is booked until you approve. Call or text the guest first if you need to.",
+                          *([card(b) for b in pending] or [empty_state("check", "No requests waiting. 🎉",
+                                                                       "New requests from your website and AI chat appear here.")]),
+                          tone=1, grid=True),
+            data_panel="requests", cls="mt-3 space-y-4"),
+        Div(admin_section("calendar", "Confirmed stays", "Approved bookings, soonest first. Send each guest their payment slip.",
+                          *([card(b) for b in upcoming] or [empty_state("calendar", "No confirmed stays yet.",
+                                                                        "Approve a request and it moves here.")]),
+                          tone=0, grid=True),
+            data_panel="stays", hidden=True, cls="mt-3"),
+        Div(admin_section("home", "Rooms & prices", "Changes show on your website right away.",
+                          *([room_card_admin(prop, r, edit_error if edit_room == r["id"] else None,
+                                             edit_values if edit_room == r["id"] else None) for r in rooms]
+                            or [empty_state("home", "No rooms yet.", "Add your first room so guests can book it.")]),
+                          tone=5, grid=True),
+            add_room_form(add_values, add_error),
+            data_panel="rooms", hidden=True, cls="mt-3"),
+        Div(admin_section("clock", "History", "Declined, cancelled and finished stays (latest 15).",
+                          *([card(b) for b in history] or [empty_state("clock", "Nothing here yet.")]),
+                          tone=3, grid=True),
+            data_panel="history", hidden=True, cls="mt-3"),
+        Script(ADMIN_TABS_JS), Script(PHOTO_JS),
+        id="admin-main", data_force=force, hx_get="/admin/body", hx_trigger="sf-admin-refresh from:body", hx_swap="outerHTML",
         cls="mx-auto w-full max-w-7xl flex-1 px-3 pb-24 pt-6 sm:px-4 sm:pt-8",
     )
 
@@ -2101,8 +2291,8 @@ def admin_header(prop):
               Div(Span(prop["name"], cls="block truncate text-[15px] font-extrabold leading-tight tracking-tight"),
                   Span("Owner dashboard", cls="block text-[11px] font-semibold text-slate-400"), cls="min-w-0"),
               href="/admin", cls="flex min-w-0 items-center gap-2.5"),
-            Nav(*[A(t, href=h, cls=link) for t, h in (("Queue", "/admin#queue"), ("Upcoming", "/admin#upcoming"),
-                                                         ("Rooms", "/admin#rooms"), ("Storefront", "/admin/storefront"))],
+            Nav(*[A(t, href=h, cls=link) for t, h in (("Bookings", "/admin#requests"), ("Rooms", "/admin#rooms"),
+                                                         ("Edit website", "/admin/storefront"))],
                 cls="hidden items-center gap-0.5 rounded-full bg-stone-100/80 p-1 md:flex"),
             Form(Button(Icon("logout", "h-4 w-4"), Span("Log out", cls="hidden sm:inline"), aria_label="Log out",
                         cls=BTN_GHOST + " !px-3 !py-2"), method="post", action="/admin/logout"),
@@ -2115,7 +2305,7 @@ def admin_header(prop):
 def admin_page(prop, title, *content):
     return page(
         f"{title} · {prop['name']}", admin_header(prop), *content,
-        chat_widget("/admin/chat", "Ops Agent", "Can act on bookings — you confirm",
+        chat_widget("/admin/chat", "AI Assistant", "Ask or tell it what to do; you confirm every change",
                     "Hi! I can review requests, approve or reject them, change rates and room status, "
                     "or draft guest messages. I'll show a card for anything that changes data — nothing happens until you tap Confirm.",
                     "Tell the agent what to do…",
@@ -2126,7 +2316,7 @@ def admin_page(prop, title, *content):
 
 def admin_respond(req, conn, prop, **kw):
     """HTMX requests get the refreshed dashboard body; plain form posts get a full page."""
-    body = dashboard_body(conn, prop, **kw)
+    body = dashboard_body(conn, prop, slug=tenant(req), **kw)
     if req.headers.get("hx-request"):
         return body
     return admin_page(prop, "Dashboard", body)
@@ -2136,11 +2326,11 @@ def admin_respond(req, conn, prop, **kw):
 def get(req):
     with db.connect(tenant(req)) as conn:
         prop = db.get_property(conn)
-        return admin_page(prop, "Dashboard", dashboard_body(conn, prop))
+        return admin_page(prop, "Dashboard", dashboard_body(conn, prop, slug=tenant(req)))
 
 
-ACTION_DONE = {"reject": "Request #{id} rejected.", "cancel": "Stay #{id} cancelled — the dates are open again.",
-               "reopen": "Request #{id} is back in the audit queue."}
+ACTION_DONE = {"reject": "Declined {name}'s request.", "cancel": "Cancelled {name}'s stay. Those dates are open again.",
+               "reopen": "{name}'s request is back in Requests."}
 
 
 @rt("/admin/bookings/{bid}/{action}")
@@ -2149,14 +2339,17 @@ def post(req, bid: int, action: str):
         return Response("Not found", status_code=404)
     with db.connect(tenant(req)) as conn:
         prop = db.get_property(conn)
+        bk = db.get_booking(conn, bid)
+        name = bk["guest_name"] if bk else f"Booking {bid}"
         try:
             if action == "approve":
                 conflicts = db.approve_booking(conn, bid)
-                flash = ((f"Can't approve #{bid}: it clashes with approved #" + ", #".join(str(c["id"]) for c in conflicts) + ".", "err")
-                         if conflicts else (f"Stay #{bid} approved — open its payment slip to send instructions.", "ok"))
+                flash = ((f"Can't approve {name}: the room is already taken by "
+                          + ", ".join(c["guest_name"] for c in conflicts) + " on those dates.", "err")
+                         if conflicts else (f"Approved {name}'s stay. Find it in Confirmed stays and send the payment slip.", "ok"))
             else:
                 db.transition_booking(conn, bid, action)
-                flash = (ACTION_DONE[action].format(id=bid), "ok")
+                flash = (ACTION_DONE[action].format(name=name), "ok")
         except LookupError:
             flash = (f"Booking #{bid} doesn't exist.", "err")
         except db.TransitionError as e:
@@ -2227,8 +2420,26 @@ def get(req, bid: int):
 
 
 def _room_form_values(form) -> dict:
-    return {k: (form.get(k) or "") for k in ("name", "rate_per_night", "capacity", "amenities", "description",
-                                              "image_url", "status", "sort_order")}
+    v = {k: (form.get(k) or "") for k in ("name", "rate_per_night", "capacity", "amenities", "description",
+                                           "image_url", "status", "sort_order")}
+    if str(form.get("image_link") or "").strip():  # a pasted link replaces the current photo
+        v["image_url"] = str(form.get("image_link")).strip()
+    return v
+
+
+async def _room_photo_upload(form) -> bytes | None:
+    """Bytes of an uploaded room photo, or None if no file was chosen."""
+    f = form.get("image_file")
+    if f is None or isinstance(f, str) or not getattr(f, "filename", ""):
+        return None
+    data = await f.read(db.MAX_UPLOAD_BYTES + 1)
+    return data or None
+
+
+def _store_room_photo(slug: str, clean: dict, data: bytes | None) -> None:
+    """Save the upload (after the rest of the form validated) and point the room at it."""
+    if data is not None:
+        clean["image_url"] = db.save_upload(slug, data)
 
 
 @rt("/admin/rooms/{rid}")
@@ -2245,9 +2456,9 @@ async def post(req, rid: int):
             if rate < 0:
                 raise ValueError
             db.update_room(conn, rid, rate_per_night=rate, status=form.get("status", ""))
-            flash = (f"{r['name']} saved — {money(prop, rate)} / night, {ROOM_STATUS_LABEL[form.get('status')].lower()}.", "ok")
+            flash = (f"{r['name']} updated: {money(prop, rate)} per night, {ROOM_STATUS_HELP[form.get('status')].split(':')[0].lower()}.", "ok")
         except (ValueError, KeyError):
-            flash = (f"Couldn't save {r['name']}: enter a whole-number rate and pick a status.", "err")
+            flash = (f"Couldn't update {r['name']}: enter the price as a whole number and pick a status.", "err")
         return admin_respond(req, conn, prop, flash=flash)
 
 
@@ -2255,15 +2466,22 @@ async def post(req, rid: int):
 async def post(req, rid: int):
     form = await req.form()
     values = _room_form_values(form)
+    upload = await _room_photo_upload(form)
     with db.connect(tenant(req)) as conn:
         prop = db.get_property(conn)
-        if db.get_room(conn, rid) is None:
+        old = db.get_room(conn, rid)
+        if old is None:
             return admin_respond(req, conn, prop, flash=(f"Room #{rid} doesn't exist.", "err"))
         try:
-            db.update_room(conn, rid, **db.clean_room(**values))
+            clean = db.clean_room(**values)
+            _store_room_photo(tenant(req), clean, upload)
+            db.update_room(conn, rid, **clean)
         except ValueError as e:
+            values["image_url"] = old["image_url"] if upload else values["image_url"]
             return admin_respond(req, conn, prop, flash=(str(e), "err"), edit_room=rid, edit_values=values, edit_error=str(e))
-        return admin_respond(req, conn, prop, flash=(f"{values['name'].strip()} updated.", "ok"))
+        if old["image_url"] != clean["image_url"]:
+            db.delete_upload(tenant(req), old["image_url"])  # don't leave replaced photos on disk
+        return admin_respond(req, conn, prop, flash=(f"{clean['name']} updated" + (" with the new photo." if upload else "."), "ok"))
 
 
 @rt("/admin/rooms/{rid}/delete")
@@ -2275,6 +2493,7 @@ def post(req, rid: int):
             return admin_respond(req, conn, prop, flash=(f"Room #{rid} doesn't exist.", "err"))
         try:
             db.delete_room(conn, rid)
+            db.delete_upload(tenant(req), r["image_url"])
             flash = (f"{r['name']} deleted.", "ok")
         except ValueError as e:
             flash = (str(e), "err")
@@ -2286,10 +2505,12 @@ async def post(req):
     form = await req.form()
     values = _room_form_values(form)
     values["status"] = "available"
+    upload = await _room_photo_upload(form)
     with db.connect(tenant(req)) as conn:
         prop = db.get_property(conn)
         try:
             clean = db.clean_room(**values)
+            _store_room_photo(tenant(req), clean, upload)
             nxt = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM rooms").fetchone()[0]
             clean["sort_order"] = nxt
             db.add_room(conn, **clean)
@@ -2564,10 +2785,24 @@ def post(req, sess, aid: str):
     return card, HtmxResponseHeaders(trigger="sf-admin-refresh")
 
 
+@rt("/media/{name}")
+def get(req, name: str):
+    """Photos owners uploaded (per tenant). Public: the storefront shows them."""
+    path = db.media_path(tenant(req), name)
+    if path is None or not path.is_file():
+        return Response("Not found", status_code=404)
+    return FileResponse(path, media_type=db.MEDIA_TYPES[name.rsplit(".", 1)[1]],
+                        headers={"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"})
+
+
+# fast_app's built-in static route (/{fname}.{ext}) would otherwise catch /media/*.jpg first.
+app.routes.insert(0, app.routes.pop(next(i for i, r in enumerate(app.routes) if getattr(r, "path", "") == "/media/{name}")))
+
+
 @rt("/admin/body")
 def get(req):
     with db.connect(tenant(req)) as conn:
-        return dashboard_body(conn, db.get_property(conn))
+        return dashboard_body(conn, db.get_property(conn), slug=tenant(req))
 
 
 # --------------------------------------------------------------------------- #

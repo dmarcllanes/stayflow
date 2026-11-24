@@ -509,6 +509,65 @@ def booking_counts(conn: sqlite3.Connection, room_id: int) -> int:
 # Rooms
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Uploaded photos: $DATA_DIR/uploads/<tenant>/<random>.<ext>, served at /media/<file>
+# --------------------------------------------------------------------------- #
+
+MEDIA_PREFIX = "/media/"
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+_MEDIA_NAME_RE = re.compile(r"^[a-f0-9]{32}\.(jpg|png|webp|gif)$")
+MEDIA_TYPES = {"jpg": "image/jpeg", "png": "image/png", "webp": "image/webp", "gif": "image/gif"}
+
+
+def _sniff_image(data: bytes) -> str | None:
+    """File type from the bytes themselves (never trust the filename or browser's content-type)."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    return None
+
+
+def is_media_url(url: str) -> bool:
+    return bool(url) and url.startswith(MEDIA_PREFIX) and bool(_MEDIA_NAME_RE.match(url[len(MEDIA_PREFIX):]))
+
+
+def media_path(slug: str, name: str) -> Path | None:
+    if not valid_slug(slug) or not _MEDIA_NAME_RE.match(name):
+        return None
+    return DATA_DIR / "uploads" / slug / name
+
+
+def save_upload(slug: str, data: bytes) -> str:
+    """Store an uploaded image for a tenant and return its /media/ URL. Raises ValueError for bad files."""
+    if not data:
+        raise ValueError("The photo file is empty.")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"That photo is too big (max {MAX_UPLOAD_BYTES // 1024 // 1024} MB).")
+    ext = _sniff_image(data)
+    if ext is None:
+        raise ValueError("That file isn't a supported photo. Use JPG, PNG, WebP or GIF.")
+    folder = DATA_DIR / "uploads" / slug
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"{secrets.token_hex(16)}.{ext}"
+    tmp = folder / (name + ".part")
+    tmp.write_bytes(data)
+    tmp.replace(folder / name)  # atomic: never serve a half-written file
+    return MEDIA_PREFIX + name
+
+
+def delete_upload(slug: str, url: str) -> None:
+    """Remove a tenant's uploaded photo (no-op for external links or unknown files)."""
+    if is_media_url(url):
+        path = media_path(slug, url[len(MEDIA_PREFIX):])
+        if path:
+            path.unlink(missing_ok=True)
+
+
 def clean_room(*, name: str, rate_per_night, capacity, description: str = "", amenities: str = "",
                image_url: str = "", status: str = "available", sort_order=0) -> dict:
     """Validate owner room input. Raises ValueError with an owner-facing message."""
@@ -530,7 +589,7 @@ def clean_room(*, name: str, rate_per_night, capacity, description: str = "", am
     if status not in ROOM_STATUSES:
         raise ValueError("Pick a valid status.")
     image_url = (image_url or "").strip()
-    if image_url and not image_url.startswith(("https://", "http://")):
+    if image_url and not is_media_url(image_url) and not image_url.startswith(("https://", "http://")):
         raise ValueError("Image URL must start with https://")
     try:
         order = int(str(sort_order or 0).strip())
