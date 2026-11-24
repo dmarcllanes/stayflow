@@ -314,8 +314,13 @@ function sfChat(open){
   if(show){ const l=document.getElementById('chat-log'); l.scrollTop=l.scrollHeight;
             setTimeout(()=>p.querySelector('input[name=message]').focus(),50); }
 }
-function sfAsk(btn){
-  const f=document.getElementById('chat-form'); f.elements.message.value=btn.textContent; f.requestSubmit();
+function sfAsk(btn){ sfSay(btn.textContent); }
+function sfSay(text){
+  const f=document.getElementById('chat-form'); f.elements.message.value=text; f.requestSubmit();
+}
+function sfDismiss(btn, focus){
+  const c=btn.closest('[data-card]'); if(c) c.remove();
+  if(focus) document.querySelector('#chat-form input[name=message]').focus();
 }
 function sfChatDone(f){
   f.reset(); const s=document.getElementById('chat-suggest'); if(s) s.remove();
@@ -334,6 +339,14 @@ def page(title: str, *content):
 # Floating chat widget (bottom-right corner)
 # --------------------------------------------------------------------------- #
 
+def _md(text: str) -> NotStr:
+    import html, re as _re
+    t = html.escape(text)
+    t = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
+    t = _re.sub(r"(?m)^\s*[-*•]\s+", "• ", t)
+    return NotStr(t)
+
+
 def chat_bubble(role: str, text: str):
     mine = role == "user"
     if mine:
@@ -344,7 +357,7 @@ def chat_bubble(role: str, text: str):
         Div(Icon("sparkles", "h-3.5 w-3.5"),
             cls="mt-0.5 grid h-7 w-7 shrink-0 place-items-center rounded-full bg-gradient-to-br from-teal-500 "
                 "to-cyan-600 text-white"),
-        Div(text, cls="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-tl-md bg-white px-3.5 py-2 text-sm "
+        Div(_md(text), cls="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-tl-md bg-white px-3.5 py-2 text-sm "
                       "text-slate-800 shadow-sm ring-1 ring-slate-200/70"),
         cls="sf-bubble flex items-start gap-2",
     )
@@ -891,12 +904,13 @@ def site_page(prop, rooms, title: str, active: str, *content, bookbar=True, book
             bar,
             hx_boost="true", cls="flex flex-1 flex-col",
         ),
-        chat_widget("/chat/guest", "Room Concierge", "Online · replies instantly",
-                    f"Hi! 👋 I'm the {prop['name']} concierge. Ask me about rooms, rates, services, or your dates.",
-                    "Ask about rooms or dates…",
-                    suggestions=("Which rooms are available?", "Room for 4 guests?", "What services do you offer?",
+        chat_widget("/chat/guest", "Booking Agent", "Online · can check dates & book",
+                    f"Hi! 👋 I'm the {prop['name']} booking agent. Tell me your dates and group size — "
+                    "I'll check live availability, quote the exact price and send your request.",
+                    "e.g. 2 guests, Dec 20 to 22…",
+                    suggestions=("Free rooms this weekend for 2?", "Book a room for 4 next Friday", "Check my booking status",
                                  "How does payment work?"),
-                    footnote="Answers come from live room data. Bookings are final only once the owner approves."),
+                    footnote="Requests are confirmed only after the owner approves them. Nothing is charged here."),
     )
 
 
@@ -1555,11 +1569,143 @@ def post(req, room_id: str = "", check_in: str = "", check_out: str = "", guests
     )
 
 
+# --------------------------------------------------------------------------- #
+# Agent cards (rendered under the agent's reply)
+# --------------------------------------------------------------------------- #
+
+CARD_WRAP = "sf-bubble ml-9 rounded-2xl bg-white p-3 shadow-sm ring-1 ring-slate-200/70"
+
+
+def _row(label, value, strong=False):
+    return Div(Span(label, cls="text-slate-500"), Span(value, cls="font-bold text-slate-900" if strong else "font-semibold text-slate-800"),
+               cls="flex justify-between gap-3 text-xs")
+
+
+def card_rooms(prop, c, rooms_by_id):
+    nights = c["nights"]
+    items = []
+    for r in sorted(c["rooms"], key=lambda r: (not r["available"], r["total"])):
+        room = rooms_by_id.get(r["room_id"])
+        items.append(Div(
+            Div(room_media(room) if room else None, cls="h-20 overflow-hidden rounded-xl bg-stone-200"),
+            P(r["name"], cls="mt-2 truncate text-xs font-bold text-slate-900"),
+            P(Span(money(prop, r["total"]), cls="font-extrabold"), f" · {nights} night{'s' if nights != 1 else ''}",
+              cls="text-[11px] text-slate-600"),
+            Button("Book this", type="button", cls=BTN_PRIMARY + " mt-2 w-full !py-1.5 !text-xs",
+                   onclick=f"sfSay({json.dumps('I want to book the ' + r['name'])})")
+            if r["available"] else P(r["reason"], cls="mt-2 rounded-lg bg-stone-100 px-2 py-1 text-center text-[11px] font-semibold text-slate-500"),
+            cls="w-36 shrink-0" + ("" if r["available"] else " opacity-60")))
+    free = sum(r["available"] for r in c["rooms"])
+    return Div(
+        P(Icon("calendar", "h-3.5 w-3.5"), f"{short_date(c['check_in'])} → {short_date(c['check_out'])} · {free} of {len(c['rooms'])} rooms free",
+          cls="flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wide text-slate-500"),
+        Div(*items, cls="sf-noscroll mt-2 flex gap-2 overflow-x-auto pb-1"),
+        data_card="rooms", cls=CARD_WRAP)
+
+
+def card_booking_draft(prop, c):
+    return Div(
+        Div(Span(Icon("document", "h-4 w-4"), cls="grid h-8 w-8 place-items-center rounded-full bg-teal-100 text-teal-700"),
+            Div(P("Review your stay request", cls="text-sm font-bold"), P("Nothing is charged now.", cls="text-[11px] text-slate-500")),
+            cls="flex items-center gap-2"),
+        Div(_row("Room", c["room_name"]), _row("Dates", f"{short_date(c['check_in'])} → {short_date(c['check_out'])}"),
+            _row("Guests", str(c["guests"])), _row("Name", c["guest_name"]), _row("Mobile", c["guest_phone"]),
+            _row("Email", c["guest_email"]) if c.get("guest_email") else None,
+            _row("Notes", c["notes"][:60]) if c.get("notes") else None,
+            Div(cls="my-1 border-t border-dashed border-slate-200"),
+            _row(f"{c['nights']} night{'s' if c['nights'] != 1 else ''} × {money(prop, c['rate_per_night'])}", money(prop, c["total_amount"]), True),
+            _row(f"Downpayment after approval ({prop['downpayment_pct']}%)", money(prop, c["downpayment_amount"])),
+            cls="mt-3 space-y-1.5 rounded-xl bg-stone-50 p-3"),
+        Div(Button(Icon("send", "h-4 w-4"), "Send request", type="button", cls=BTN_ACCENT + " flex-1 !py-2",
+                   hx_post=f"/chat/guest/confirm/{c['id']}", hx_target="closest [data-card]", hx_swap="outerHTML",
+                   hx_disabled_elt="this"),
+            Button("Change", type="button", cls=BTN_GHOST + " !py-2", onclick="sfDismiss(this,true)"),
+            cls="mt-3 flex gap-2"),
+        data_card="draft", cls=CARD_WRAP + " ring-2 !ring-teal-200")
+
+
+def card_status(prop, c):
+    tone = STATUS_TONE[c["status"]]
+    return Div(Div(P(f"Request #{c['id']}", cls="text-xs font-bold text-slate-500"), Badge(c["status"].replace("_", " "), tone),
+                   cls="flex items-center justify-between"),
+               P(c["room_name"], cls="mt-1 text-sm font-bold"),
+               P(f"{short_date(c['check_in'])} → {short_date(c['check_out'])} · {money(prop, c['total_amount'])}", cls="text-xs text-slate-600"),
+               data_card="status", cls=CARD_WRAP)
+
+
+OWNER_VERB = {"approve": ("Approve", BTN_ACCENT), "reject": ("Reject", BTN_DANGER), "cancel": ("Cancel stay", BTN_DANGER),
+              "reopen": ("Reopen", BTN_PRIMARY), "update_room": ("Apply change", BTN_PRIMARY)}
+
+
+def card_owner_action(prop, c):
+    verb, btn = OWNER_VERB[c["action"]]
+    if c["action"] == "update_room":
+        ch, before = c["changes"], c["before"]
+        lines = [_row("Room", c["room_name"])]
+        if "rate_per_night" in ch:
+            lines.append(_row("Rate", f"{money(prop, before['rate_per_night'])} → {money(prop, ch['rate_per_night'])}", True))
+        if "status" in ch:
+            lines.append(_row("Status", f"{before['status']} → {ch['status']}", True))
+        title = f"Update {c['room_name']}"
+    else:
+        lines = [_row("Guest", c["guest_name"]), _row("Room", c["room_name"]),
+                 _row("Dates", f"{short_date(c['check_in'])} → {short_date(c['check_out'])}"),
+                 _row("Total", money(prop, c["total_amount"]), True)]
+        if c.get("reason"):
+            lines.append(_row("Why", c["reason"][:70]))
+        title = f"{verb} booking #{c['booking_id']}"
+    return Div(P(Icon("sparkles", "h-3.5 w-3.5"), title, cls="flex items-center gap-1.5 text-sm font-bold"),
+               Div(*lines, cls="mt-2 space-y-1.5 rounded-xl bg-stone-50 p-3"),
+               Div(Button(Icon("check", "h-4 w-4"), "Confirm", type="button", cls=btn + " flex-1 !py-2",
+                          hx_post=f"/admin/chat/confirm/{c['id']}", hx_target="closest [data-card]", hx_swap="outerHTML",
+                          hx_disabled_elt="this"),
+                   Button("Dismiss", type="button", cls=BTN_GHOST + " !py-2", onclick="sfDismiss(this)"),
+                   cls="mt-3 flex gap-2"),
+               data_card="action", cls=CARD_WRAP)
+
+
+def render_cards(conn, prop, cards):
+    rooms_by_id = {r["id"]: r for r in db.list_rooms(conn, include_hidden=True)}
+    out = []
+    for c in cards:
+        if c["type"] == "rooms":
+            out.append(card_rooms(prop, c, rooms_by_id))
+        elif c["type"] == "booking_draft":
+            out.append(card_booking_draft(prop, c))
+        elif c["type"] == "status":
+            out.append(card_status(prop, c))
+        elif c["type"] == "owner_action":
+            out.append(card_owner_action(prop, c))
+    return out
+
+
+def result_card(ok: bool, title: str, body: str = ""):
+    return Div(Div(Icon("check" if ok else "x", "h-4 w-4"),
+                   cls="grid h-8 w-8 shrink-0 place-items-center rounded-full " + ("bg-emerald-500 text-white" if ok else "bg-rose-100 text-rose-700")),
+               Div(P(title, cls="text-sm font-bold"), P(body, cls="text-xs text-slate-600") if body else None, cls="min-w-0"),
+               data_card="result", cls=CARD_WRAP + " flex items-start gap-3" + (" ring-2 !ring-emerald-200" if ok else ""))
+
+
 @rt("/chat/guest")
 async def post(req, sess, message: str = ""):
     with db.connect(tenant(req)) as conn:
-        answer = await ai.guest_reply(conn, tenant(req), chat_id(sess), message)
-    return chat_bubble("user", message.strip()[:ai.MAX_USER_CHARS]), chat_bubble("assistant", answer)
+        prop = db.get_property(conn)
+        answer, cards = await ai.guest_reply(conn, tenant(req), chat_id(sess), message)
+        return (chat_bubble("user", message.strip()[:ai.MAX_USER_CHARS]), chat_bubble("assistant", answer),
+                *render_cards(conn, prop, cards))
+
+
+@rt("/chat/guest/confirm/{aid}")
+def post(req, sess, aid: str):
+    with db.connect(tenant(req)) as conn:
+        prop = db.get_property(conn)
+        ok, ref, bid = ai.confirm_guest_request(conn, tenant(req), chat_id(sess), aid)
+        if not ok:
+            return result_card(False, "Couldn't send the request", ref)
+        b = db.get_booking(conn, bid)
+    return result_card(True, f"Request sent · {ref}",
+                       f"The owner will review it and message you at {b['guest_phone']} with "
+                       f"{prop['downpayment_pct']}% downpayment instructions. Keep your reference to check the status here.")
 
 
 # --------------------------------------------------------------------------- #
@@ -1902,7 +2048,8 @@ def dashboard_body(conn, prop, flash=None, add_values=None, add_error=None, edit
                               count=len(rooms), id="rooms", tone=5),
                 cls="space-y-6"),
             cls="mt-6 grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)] [&>*]:min-w-0"),
-        id="admin-main", cls="mx-auto w-full max-w-7xl flex-1 px-3 pb-24 pt-6 sm:px-4 sm:pt-8",
+        id="admin-main", hx_get="/admin/body", hx_trigger="sf-admin-refresh from:body", hx_swap="outerHTML",
+        cls="mx-auto w-full max-w-7xl flex-1 px-3 pb-24 pt-6 sm:px-4 sm:pt-8",
     )
 
 
@@ -1927,11 +2074,12 @@ def admin_header(prop):
 def admin_page(prop, title, *content):
     return page(
         f"{title} · {prop['name']}", admin_header(prop), *content,
-        chat_widget("/admin/chat", "Ops Co-Pilot", "Knows your live bookings",
-                    "Hi! Ask about conflicts, occupancy, revenue, or have me draft a guest message.",
-                    "Ask the co-pilot…",
-                    suggestions=("Which pending requests clash?", "Occupancy this week?",
-                                 "Draft a reminder for tomorrow's check-ins")),
+        chat_widget("/admin/chat", "Ops Agent", "Can act on bookings — you confirm",
+                    "Hi! I can review requests, approve or reject them, change rates and room status, "
+                    "or draft guest messages. I'll show a card for anything that changes data — nothing happens until you tap Confirm.",
+                    "Tell the agent what to do…",
+                    suggestions=("Approve all clash-free requests", "Which pending requests clash?",
+                                 "Set Garden Cabin to available", "Draft a reminder for tomorrow's check-ins")),
     )
 
 
@@ -2112,8 +2260,24 @@ async def post(req):
 @rt("/admin/chat")
 async def post(req, sess, message: str = ""):
     with db.connect(tenant(req)) as conn:
-        answer = await ai.owner_reply(conn, tenant(req), chat_id(sess), message)
-    return chat_bubble("user", message.strip()[:1500]), chat_bubble("assistant", answer)
+        prop = db.get_property(conn)
+        answer, cards = await ai.owner_reply(conn, tenant(req), chat_id(sess), message)
+        return chat_bubble("user", message.strip()[:1500]), chat_bubble("assistant", answer), *render_cards(conn, prop, cards)
+
+
+@rt("/admin/chat/confirm/{aid}")
+def post(req, sess, aid: str):
+    with db.connect(tenant(req)) as conn:
+        ok, msg = ai.confirm_owner_action(conn, tenant(req), chat_id(sess), aid)
+    card = result_card(ok, "Done" if ok else "Not applied", msg)
+    # Tell the dashboard to reload its data so stats and lists match what the agent just did.
+    return card, HtmxResponseHeaders(trigger="sf-admin-refresh")
+
+
+@rt("/admin/body")
+def get(req):
+    with db.connect(tenant(req)) as conn:
+        return dashboard_body(conn, db.get_property(conn))
 
 
 # --------------------------------------------------------------------------- #

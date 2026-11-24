@@ -322,12 +322,14 @@ def quote(rate_per_night: int, nights: int, downpayment_pct: int) -> tuple[int, 
     return total, math.ceil(total * downpayment_pct / 100)
 
 
-def create_booking_request(conn: sqlite3.Connection, *, room_id: int, guest_name: str,
-                           guest_phone: str, guest_email: str, guests: int,
-                           check_in: str, check_out: str, notes: str) -> int:
-    """Validate and insert a ``pending_audit`` booking. Raises BookingError on bad input."""
+def validate_booking_request(conn: sqlite3.Connection, *, room_id: int, guest_name: str,
+                             guest_phone: str, guests: int, check_in: str, check_out: str) -> dict:
+    """All guest-facing checks for a stay request, without writing. Returns the priced request.
+
+    Raises BookingError with a message that is safe to show to the guest.
+    """
     try:
-        d_in, d_out = date.fromisoformat(check_in), date.fromisoformat(check_out)
+        d_in, d_out = date.fromisoformat(str(check_in)), date.fromisoformat(str(check_out))
     except ValueError:
         raise BookingError("Please pick valid check-in and check-out dates.")
     today = date.today()
@@ -340,32 +342,86 @@ def create_booking_request(conn: sqlite3.Connection, *, room_id: int, guest_name
         raise BookingError("Check-out must be after check-in.")
     if nights > MAX_NIGHTS:
         raise BookingError(f"For stays longer than {MAX_NIGHTS} nights, please contact us directly.")
-    if not guest_name.strip() or not guest_phone.strip():
+    if not str(guest_name).strip() or not str(guest_phone).strip():
         raise BookingError("Name and mobile number are required.")
+    if sum(c.isdigit() for c in str(guest_phone)) < 7:
+        raise BookingError("Please give a mobile number we can reach you on.")
+    try:
+        guests = int(guests)
+    except (TypeError, ValueError):
+        raise BookingError("Number of guests must be a whole number.")
     if guests < 1:
         raise BookingError("Number of guests must be at least 1.")
+    room = get_room(conn, int(room_id))
+    if room is None or room["status"] != "available":
+        raise BookingError("That room isn't open for booking right now.")
+    if guests > room["capacity"]:
+        raise BookingError(f"{room['name']} fits up to {room['capacity']} guests.")
+    if find_overlaps(conn, room["id"], d_in.isoformat(), d_out.isoformat()):
+        raise BookingError(f"{room['name']} is already booked for part of those dates. "
+                           "Try other dates or another room.")
+    total, down = quote(room["rate_per_night"], nights, get_property(conn)["downpayment_pct"])
+    return dict(room_id=room["id"], room_name=room["name"], guests=guests, check_in=d_in.isoformat(),
+                check_out=d_out.isoformat(), nights=nights, rate_per_night=room["rate_per_night"],
+                total_amount=total, downpayment_amount=down)
 
-    prop = get_property(conn)
-    with transaction(conn):
-        room = get_room(conn, room_id)
-        if room is None or room["status"] != "available":
-            raise BookingError("That room isn't open for booking right now.")
-        if guests > room["capacity"]:
-            raise BookingError(f"{room['name']} fits up to {room['capacity']} guests.")
-        if find_overlaps(conn, room_id, d_in.isoformat(), d_out.isoformat()):
-            raise BookingError(f"{room['name']} is already booked for part of those dates. "
-                               "Try other dates or another room.")
-        total, down = quote(room["rate_per_night"], nights, prop["downpayment_pct"])
+
+def create_booking_request(conn: sqlite3.Connection, *, room_id: int, guest_name: str,
+                           guest_phone: str, guest_email: str, guests: int,
+                           check_in: str, check_out: str, notes: str) -> int:
+    """Validate and insert a ``pending_audit`` booking. Raises BookingError on bad input."""
+    with transaction(conn):  # validate under the write lock so the overlap check can't race
+        v = validate_booking_request(conn, room_id=room_id, guest_name=guest_name, guest_phone=guest_phone,
+                                     guests=guests, check_in=check_in, check_out=check_out)
         cur = conn.execute(
             """INSERT INTO bookings (room_id, guest_name, guest_phone, guest_email, guests,
                    check_in, check_out, notes, nights, rate_per_night, total_amount,
                    downpayment_amount, status)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending_audit')""",
-            (room_id, guest_name.strip()[:120], guest_phone.strip()[:40], guest_email.strip()[:120],
-             guests, d_in.isoformat(), d_out.isoformat(), notes.strip()[:1000], nights,
-             room["rate_per_night"], total, down),
+            (v["room_id"], str(guest_name).strip()[:120], str(guest_phone).strip()[:40],
+             str(guest_email or "").strip()[:120], v["guests"], v["check_in"], v["check_out"],
+             str(notes or "").strip()[:1000], v["nights"], v["rate_per_night"], v["total_amount"],
+             v["downpayment_amount"]),
         )
         return cur.lastrowid
+
+
+def availability(conn: sqlite3.Connection, check_in: str, check_out: str, guests: int | None = None) -> dict:
+    """Per-room availability + price for a date range (no guest PII). Raises BookingError on bad dates."""
+    try:
+        d_in, d_out = date.fromisoformat(str(check_in)), date.fromisoformat(str(check_out))
+    except ValueError:
+        raise BookingError("Dates must look like YYYY-MM-DD.")
+    if d_in < date.today():
+        raise BookingError("Check-in date is in the past.")
+    nights = (d_out - d_in).days
+    if not 1 <= nights <= MAX_NIGHTS:
+        raise BookingError(f"Stays must be 1–{MAX_NIGHTS} nights.")
+    pct = get_property(conn)["downpayment_pct"]
+    out = []
+    for r in list_rooms(conn):
+        reason = None
+        if r["status"] != "available":
+            reason = "under maintenance"
+        elif guests and guests > r["capacity"]:
+            reason = f"fits only {r['capacity']} guests"
+        elif find_overlaps(conn, r["id"], d_in.isoformat(), d_out.isoformat()):
+            reason = "already booked on some of these nights"
+        total, down = quote(r["rate_per_night"], nights, pct)
+        out.append(dict(room_id=r["id"], name=r["name"], capacity=r["capacity"], rate_per_night=r["rate_per_night"],
+                        total=total, downpayment=down, available=reason is None, reason=reason))
+    return dict(check_in=d_in.isoformat(), check_out=d_out.isoformat(), nights=nights, rooms=out)
+
+
+def parse_booking_ref(ref: str) -> int | None:
+    """'SF-DEMO-12', '#12' or '12' -> 12."""
+    m = re.search(r"(\d+)\s*$", str(ref or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def phones_match(a: str, b: str) -> bool:
+    da, dbb = "".join(c for c in str(a) if c.isdigit()), "".join(c for c in str(b) if c.isdigit())
+    return len(da) >= 7 and len(dbb) >= 7 and da[-7:] == dbb[-7:]
 
 
 # Allowed status changes: action -> (required current status, new status).
