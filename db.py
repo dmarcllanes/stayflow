@@ -639,7 +639,7 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def _url(value: str, label: str) -> str:
     value = (value or "").strip()
-    if value and not value.startswith(("https://", "http://")):
+    if value and not is_media_url(value) and not value.startswith(("https://", "http://")):
         raise ValueError(f"{label} must start with https://")
     return value[:500]
 

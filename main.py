@@ -1974,7 +1974,8 @@ PHOTO_JS = """
 function sfPhotoBox(el){ return el.closest('[data-photo-field]'); }
 function sfPhotoShow(box, src){
   const img=box.querySelector('img'), ph=box.querySelector('[data-photo-empty]');
-  img.src=src||''; img.hidden=!src; ph.hidden=!!src; box.querySelector('[data-photo-remove]').hidden=!src;
+  img.src=src||''; img.hidden=!src; ph.hidden=!!src;
+  const rm=box.querySelector('[data-photo-remove]'); if(rm) rm.hidden=!src;
 }
 async function sfPhotoPick(inp){
   const f=inp.files&&inp.files[0], box=sfPhotoBox(inp); if(!f) return;
@@ -1995,25 +1996,26 @@ async function sfPhotoPick(inp){
   }
   if(out.size>8*1024*1024){ inp.value=''; if(window.sfToast) sfToast('That photo is too big (max 8 MB).'); return; }
   sfPhotoShow(box, URL.createObjectURL(out));
-  box.querySelector('[data-photo-note]').textContent='New photo selected. Save to upload it.';
-  box.querySelector('input[name=image_link]').value='';
+  sfPhotoNote(box, 'New photo selected. Save to upload it.');
+  box.querySelector('[data-photo-link]').value='';
 }
 function sfPhotoLink(inp){
   const box=sfPhotoBox(inp), v=inp.value.trim();
   if(/^https?:\\/\\//.test(v)){ box.querySelector('input[type=file]').value=''; sfPhotoShow(box, v);
-    box.querySelector('[data-photo-note]').textContent='Using the photo link. Save to apply.'; }
+    sfPhotoNote(box, 'Using the photo link. Save to apply.'); }
 }
 function sfPhotoClear(btn){
   const box=sfPhotoBox(btn);
-  box.querySelector('input[type=file]').value=''; box.querySelector('input[name=image_link]').value='';
-  box.querySelector('input[name=image_url]').value=''; sfPhotoShow(box,'');
-  box.querySelector('[data-photo-note]').textContent='Photo removed. Save to apply (a sample photo shows until you add one).';
+  box.querySelector('input[type=file]').value=''; box.querySelector('[data-photo-link]').value='';
+  box.querySelector('[data-photo-current]').value=''; sfPhotoShow(box,'');
+  sfPhotoNote(box, 'Photo removed. Save to apply (a sample photo shows until you add one).');
 }
+function sfPhotoNote(box, text){ const n=box.querySelector('[data-photo-note]'); if(n) n.textContent=text; }
 """
 
 
-def photo_field(url: str = "", label: str = "Room photo"):
-    """Upload-or-link photo picker. Posts image_file (upload), image_link (pasted link) and image_url (current)."""
+def photo_field(url: str = "", label: str = "Room photo", name: str = "image", hint: str | None = None, big: bool = False):
+    """Upload-or-link photo picker. Posts {name}_file (upload), {name}_link (pasted link) and {name}_url (current)."""
     src = safe_url(url)
     link = url if url and not db.is_media_url(url) else ""
     return Div(
@@ -2021,21 +2023,23 @@ def photo_field(url: str = "", label: str = "Room photo"):
         Div(Div(Img(src=src, alt="", hidden=not src, cls="h-full w-full object-cover"),
                 Span(Icon("camera", "h-7 w-7"), Span("No photo yet", cls="text-[11px] font-semibold"), data_photo_empty="1",
                      hidden=bool(src), cls="flex flex-col items-center gap-1 text-slate-400"),
-                cls="grid h-28 w-full shrink-0 place-items-center overflow-hidden rounded-2xl bg-stone-100 ring-1 ring-stone-200 sm:w-40"),
+                cls="grid w-full shrink-0 place-items-center overflow-hidden rounded-2xl bg-stone-100 ring-1 ring-stone-200 "
+                    + ("h-32 sm:w-56" if big else "h-28 sm:w-40")),
             Div(Div(Label(Icon("camera", "h-4 w-4"), "Upload photo",
-                          Input(type="file", name="image_file", accept="image/jpeg,image/png,image/webp,image/gif",
+                          Input(type="file", name=f"{name}_file", accept="image/jpeg,image/png,image/webp,image/gif",
                                 onchange="sfPhotoPick(this)", cls="sr-only"),
                           cls=BTN_PRIMARY + " cursor-pointer !px-4 !py-2 focus-within:ring-2 focus-within:ring-teal-400"),
                     Button(Icon("trash", "h-4 w-4"), "Remove", type="button", onclick="sfPhotoClear(this)", data_photo_remove="1",
                            hidden=not src, cls=BTN_GHOST + " !px-4 !py-2"),
                     cls="flex flex-wrap gap-2"),
-                P("From your phone or computer: JPG, PNG or WebP. Big photos are shrunk automatically.", data_photo_note="1",
+                P(hint or "From your phone or computer: JPG, PNG or WebP. Big photos are shrunk automatically.", data_photo_note="1",
                   cls="mt-2 text-[11px] text-slate-500"),
-                Input(name="image_link", value=link, type="url", maxlength="500", placeholder="…or paste a photo link (https://…)",
-                      oninput="sfPhotoLink(this)", aria_label="Photo link", cls=INPUT + " mt-2 !min-h-[2.5rem] !py-1.5 text-sm"),
+                Input(name=f"{name}_link", value=link, type="url", maxlength="500", placeholder="…or paste a photo link (https://…)",
+                      oninput="sfPhotoLink(this)", aria_label="Photo link", data_photo_link="1",
+                      cls=INPUT + " mt-2 !min-h-[2.5rem] !py-1.5 text-sm"),
                 cls="min-w-0 flex-1"),
             cls="mt-1.5 flex flex-col gap-3 sm:flex-row sm:items-start"),
-        Input(type="hidden", name="image_url", value=url or ""),
+        Input(type="hidden", name=f"{name}_url", value=url or "", data_photo_current="1"),
         data_photo_field="1",
     )
 
@@ -2427,13 +2431,16 @@ def _room_form_values(form) -> dict:
     return v
 
 
-async def _room_photo_upload(form) -> bytes | None:
-    """Bytes of an uploaded room photo, or None if no file was chosen."""
-    f = form.get("image_file")
+async def _upload_bytes(f) -> bytes | None:
+    """Bytes of an uploaded file field, or None if no file was chosen."""
     if f is None or isinstance(f, str) or not getattr(f, "filename", ""):
         return None
     data = await f.read(db.MAX_UPLOAD_BYTES + 1)
     return data or None
+
+
+async def _room_photo_upload(form) -> bytes | None:
+    return await _upload_bytes(form.get("image_file"))
 
 
 def _store_room_photo(slug: str, clean: dict, data: bytes | None) -> None:
@@ -2532,12 +2539,14 @@ function sfAddRow(btn){
   const list=btn.closest('[data-list]'), rows=list.querySelector('[data-rows]'), max=+list.dataset.max||99;
   if(rows.children.length>=max){ sfToast('Maximum '+max+' items'); return; }
   rows.append(list.querySelector('template').content.cloneNode(true));
-  const last=rows.lastElementChild; const f=last&&last.querySelector('input,textarea'); if(f) f.focus();
+  const last=rows.lastElementChild, k='n'+Math.random().toString(36).slice(2,9);
+  if(last){
+    last.querySelectorAll('[data-keyname]').forEach(e=>e.name=e.dataset.keyname.replace('KEY',k));
+    last.querySelectorAll('[data-keyvalue]').forEach(e=>e.value=k);
+  }
+  const f=last&&last.querySelector('input:not([type=hidden]):not([type=file]),textarea'); if(f) f.focus();
 }
 function sfDelRow(btn){ btn.closest('[data-row]').remove(); }
-function sfPreview(inp){
-  const img=inp.closest('[data-row],[data-photo]').querySelector('img'); if(img && /^https?:\\/\\//.test(inp.value)) img.src=inp.value;
-}
 """
 
 
@@ -2566,7 +2575,9 @@ def parse_section(section: str, form) -> dict:
         return {"name": g("name"), "tagline": g("tagline"), "location": g("location"), "about": g("about"),
                 "highlights": _lines(g("highlights"))}
     if section == "photos":
-        return {"hero_image_url": g("hero_image_url"), "gallery": _zip_rows(form, url="gallery_url", caption="gallery_caption")}
+        rows = _zip_rows(form, key="gallery_key", url="gallery_url", link="gallery_link", caption="gallery_caption")
+        return {"hero_image_url": g("hero_image_link").strip() or g("hero_image_url"),
+                "gallery": [{"key": r["key"], "url": r["link"].strip() or r["url"], "caption": r["caption"]} for r in rows]}
     if section == "announcements":
         return {"announcements": _lines(g("announcements"))}
     if section == "services":
@@ -2585,12 +2596,12 @@ def _hint(text):
     return P(text, cls="mt-1 text-[11px] text-slate-400")
 
 
-def _row_list(key: str, label: str, add_label: str, rows, render_row, max_items: int):
+def _row_list(key: str, label: str, add_label: str, rows, render_row, max_items: int, keyed: bool = False):
     return Div(
         Div(P(label, cls="text-xs font-semibold text-slate-600"),
             Span(f"up to {max_items}", cls="text-[11px] text-slate-400"), cls="flex items-baseline justify-between"),
-        Div(*[render_row(r) for r in rows], data_rows="1", cls="mt-2 space-y-2"),
-        Template(render_row({})),
+        Div(*[render_row(r, f"r{i}") if keyed else render_row(r) for i, r in enumerate(rows)], data_rows="1", cls="mt-2 space-y-2"),
+        Template(render_row({}) if not keyed else render_row({}, "KEY")),
         Button(Icon("plus", "h-4 w-4"), add_label, type="button", onclick="sfAddRow(this)", cls=BTN_GHOST + " mt-2 !py-2"),
         data_list=key, data_max=str(max_items),
     )
@@ -2601,14 +2612,32 @@ def _del_btn():
                   cls="grid h-10 w-10 shrink-0 place-items-center rounded-full text-slate-400 transition hover:bg-rose-50 hover:text-rose-600")
 
 
-def _gallery_row(g):
-    return Div(Img(src=safe_url(g.get("url", "")) or placeholder_img(f"{g.get('caption', '')}-x", 200, 150), alt="",
-                   cls="h-12 w-16 shrink-0 rounded-xl bg-stone-200 object-cover"),
-               Input(name="gallery_url", value=g.get("url", ""), type="url", placeholder="https://… photo link",
-                     oninput="sfPreview(this)", aria_label="Photo URL", cls=INPUT + " min-w-0 flex-[2]"),
-               Input(name="gallery_caption", value=g.get("caption", ""), placeholder="Caption", maxlength="60",
-                     aria_label="Caption", cls=INPUT + " min-w-0 flex-1"),
-               _del_btn(), data_row="1", cls="flex items-center gap-2")
+def _gallery_row(g, key: str = "KEY"):
+    """One gallery slot: thumbnail, caption, upload button or pasted link. Each row's file input is named
+    gallery_file_<key> so uploads stay matched to their row (new rows get a key from sfAddRow)."""
+    url = g.get("url", "")
+    src = safe_url(url)
+    return Div(
+        Div(Img(src=src, alt="", hidden=not src, cls="h-full w-full object-cover"),
+            Span(Icon("camera", "h-5 w-5"), data_photo_empty="1", hidden=bool(src), cls="text-slate-400"),
+            cls="grid h-20 w-24 shrink-0 place-items-center overflow-hidden rounded-xl bg-stone-100 ring-1 ring-stone-200"),
+        Div(Div(Input(name="gallery_caption", value=g.get("caption", ""), placeholder="Caption, e.g. Pool at sunset", maxlength="60",
+                      aria_label="Caption", cls=INPUT + " min-w-0 flex-1 !min-h-[2.5rem] !py-1.5"),
+                _del_btn(), cls="flex items-center gap-2"),
+            Div(Label(Icon("camera", "h-4 w-4"), "Upload",
+                      Input(type="file", name=f"gallery_file_{key}", data_keyname="gallery_file_KEY",
+                            accept="image/jpeg,image/png,image/webp,image/gif", onchange="sfPhotoPick(this)", cls="sr-only"),
+                      cls=BTN_PRIMARY + " shrink-0 cursor-pointer !px-3 !py-1.5 text-xs focus-within:ring-2 focus-within:ring-teal-400"),
+                Input(name="gallery_link", value=url if url and not db.is_media_url(url) else "", type="url", maxlength="500",
+                      placeholder="or paste link", oninput="sfPhotoLink(this)", aria_label="Photo link", data_photo_link="1",
+                      cls=INPUT + " min-w-0 flex-1 !min-h-[2.25rem] !py-1 text-xs"),
+                cls="mt-2 flex items-center gap-2"),
+            P(data_photo_note="1", cls="mt-1 text-[11px] text-slate-500 empty:hidden"),
+            cls="min-w-0 flex-1"),
+        Input(type="hidden", name="gallery_url", value=url, data_photo_current="1"),
+        Input(type="hidden", name="gallery_key", value=key, data_keyvalue="1"),
+        data_row="1", data_photo_field="1",
+        cls="flex items-start gap-3 rounded-2xl bg-stone-50 p-2.5 ring-1 ring-stone-200/70")
 
 
 def _service_row(s):
@@ -2654,15 +2683,10 @@ def storefront_section_fields(key: str, v: dict):
                 Div(Field("Highlights (one per line)", Textarea("\n".join(v["highlights"]), name="highlights", rows="4", cls=INPUT)),
                     _hint("Shown as check-marked bullets, e.g. “3-minute walk to the beach”. Up to 12.")))
     if key == "photos":
-        hero = safe_url(v["hero_image_url"])
-        return (Div(P("Hero banner photo", cls="text-xs font-semibold text-slate-600"),
-                    Div(Img(src=hero or placeholder_img("hero", 600, 300), alt="", cls="h-24 w-40 shrink-0 rounded-2xl bg-stone-200 object-cover"),
-                        Div(Input(name="hero_image_url", value=v["hero_image_url"], type="url", placeholder="https://… (wide photo, 1600px+)",
-                                  oninput="sfPreview(this)", cls=INPUT),
-                            _hint("Paste a link to a hosted photo (Facebook/Google Photos share links won't work — use a direct image link)."),
-                            cls="min-w-0 flex-1"),
-                        data_photo="1", cls="mt-2 flex flex-col gap-3 sm:flex-row sm:items-start")),
-                _row_list("gallery", "Gallery photos", "Add photo", v["gallery"], _gallery_row, 12))
+        return (photo_field(v["hero_image_url"], "Hero banner photo (top of your homepage)", name="hero_image", big=True,
+                            hint="Upload a wide photo (landscape works best), or paste a direct image link."),
+                _row_list("gallery", "Gallery photos", "Add photo", v["gallery"], _gallery_row, 12, keyed=True),
+                _hint("Upload a photo or paste a link for each slot. Slots without a photo show a sample picture."))
     if key == "announcements":
         return (Div(Field("Ticker messages (one per line)", Textarea("\n".join(v["announcements"]), name="announcements", rows="5",
                                                                      placeholder="🎉 10% off weekday stays this December\nNow accepting GCash & bank transfer",
@@ -2722,6 +2746,7 @@ def storefront_editor(v: dict, flash=None, error_section: str | None = None, err
             Div(*storefront_section_fields(key, v), cls="mt-5 space-y-4"),
             Div(Button("Save", Icon("check", "h-4 w-4"), cls=BTN_PRIMARY), cls="mt-5 flex justify-end border-t border-stone-100 pt-4"),
             id=f"sec-{key}", hx_post=f"/admin/storefront/{key}", hx_target="#sf-editor", hx_swap="outerHTML",
+            **({"hx_encoding": "multipart/form-data", "enctype": "multipart/form-data"} if key == "photos" else {}),
             method="post", action=f"/admin/storefront/{key}",
             cls="scroll-mt-28 rounded-[2rem] bg-white p-4 ring-1 ring-stone-200/70 sm:p-6" + (" ring-2 !ring-rose-300" if err else ""),
         ))
@@ -2734,12 +2759,18 @@ def storefront_editor(v: dict, flash=None, error_section: str | None = None, err
             cls="flex flex-wrap items-end justify-between gap-4"),
         Div(Div(nav, cls="min-w-0"), Div(*sections, cls="min-w-0 space-y-6"),
             cls="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[14rem_minmax(0,1fr)]"),
-        Script(EDITOR_JS),
+        Script(EDITOR_JS), Script(PHOTO_JS),
         id="sf-editor", cls="mx-auto w-full max-w-6xl flex-1 px-3 pb-24 pt-6 sm:px-4 sm:pt-8",
     )
 
 
 SECTION_TITLES = {k: t for k, t, *_ in STOREFRONT_SECTIONS}
+
+
+def _property_media(v: dict) -> set[str]:
+    """Uploaded (/media/) photos the storefront currently uses."""
+    urls = [v.get("hero_image_url", "")] + [g.get("url", "") for g in v.get("gallery", []) if isinstance(g, dict)]
+    return {u for u in urls if db.is_media_url(u)}
 
 
 @rt("/admin/storefront")
@@ -2755,15 +2786,37 @@ async def post(req, section: str):
         return Response("Not found", status_code=404)
     form = await req.form()
     raw = parse_section(section, form)
+    typed = {**raw, "gallery": [dict(g) for g in raw.get("gallery", [])]} if "gallery" in raw else dict(raw)
+    slug = tenant(req)
+    uploads: list[tuple[dict | None, bytes]] = []  # (gallery row or None for hero, file bytes)
+    if section == "photos":
+        if (data := await _upload_bytes(form.get("hero_image_file"))) is not None:
+            uploads.append((None, data))
+        for row in raw["gallery"]:
+            if (data := await _upload_bytes(form.get(f"gallery_file_{row['key']}"))) is not None:
+                uploads.append((row, data))
+    saved: list[str] = []
     with db.connect(tenant(req)) as conn:
         prop = db.get_property(conn)
+        old_media = _property_media(prop_view(prop))
         try:
+            for row, data in uploads:
+                url = db.save_upload(slug, data)
+                saved.append(url)
+                if row is None:
+                    raw["hero_image_url"] = url
+                else:
+                    row["url"] = url
             db.update_property(conn, db.clean_property(raw))
         except ValueError as e:
-            v = {**prop_view(prop), **raw}  # keep what the owner typed
+            for url in saved:  # nothing half-saved
+                db.delete_upload(slug, url)
+            v = {**prop_view(prop), **typed}  # keep what the owner typed
             body = storefront_editor(v, (str(e), "err"), section, str(e))
         else:
             prop = db.get_property(conn)
+            for url in old_media - _property_media(prop_view(prop)):  # replaced or removed photos
+                db.delete_upload(slug, url)
             body = storefront_editor(prop_view(prop), (f"{SECTION_TITLES[section]} saved — live on your site now.", "ok"))
     return body if req.headers.get("hx-request") else admin_page(prop, "Storefront", body)
 
