@@ -577,6 +577,9 @@ def book_form(rooms, values: dict | None = None, error: str | None = None):
         # Live availability + price breakdown, refreshed whenever room/dates/guests change.
         Div(P("Checking availability…", cls="text-sm text-slate-500"), id="book-avail",
             hx_get="/availability", hx_trigger="load, change from:closest form delay:150ms",
+            # innerHTML explicitly: otherwise it inherits the form's outerHTML swap and the panel
+            # replaces itself on the first check, so later date/room/guest changes never update it.
+            hx_swap="innerHTML",
             hx_include="closest form", hx_sync="this:replace", aria_live="polite", cls="mt-5")
         if open_rooms else None,
         Button(Span("Send request", cls="sf-idle"),
@@ -1184,6 +1187,10 @@ def availability_panel(conn, prop, rooms, room_id: str, check_in: str, check_out
                    cls="mt-3")
 
     if n_guests > room["capacity"]:
+        if not any(r["capacity"] >= n_guests for r in open_rooms):
+            biggest = max(r["capacity"] for r in open_rooms)
+            return avail_box("warn", "users", f"No single room fits {n_guests} guests (max {biggest}).",
+                             "For bigger groups, send a request for each room you need, or message us and we'll help plan it.")
         return avail_box("warn", "users", f"{room['name']} fits up to {room['capacity']} guests.",
                          "Pick a bigger room for your group:", alternatives("Rooms that fit"))
     clashes = db.find_overlaps(conn, room["id"], check_in, check_out)
@@ -1554,7 +1561,7 @@ def post(req, room_id: str = "", check_in: str = "", check_out: str = "", guests
     return Div(
         Div(Icon("check", "h-6 w-6"), cls="grid h-12 w-12 place-items-center rounded-full bg-emerald-100 text-emerald-600"),
         H2("Request sent! 🎉", cls="mt-4 text-xl font-extrabold tracking-tight"),
-        P(f"Reference #{b['id']} · {b['room_name']}", cls="mt-2 text-sm font-semibold"),
+        P(f"Reference SF-{tenant(req).upper()}-{b['id']} · {b['room_name']}", cls="mt-2 text-sm font-semibold"),
         P(f"{nice_date(b['check_in'])} → {nice_date(b['check_out'])} ({b['nights']} night"
           f"{'s' if b['nights'] != 1 else ''}, {b['guests']} guest{'s' if b['guests'] != 1 else ''})",
           cls="text-sm text-slate-600"),
