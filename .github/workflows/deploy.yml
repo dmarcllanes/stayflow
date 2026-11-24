@@ -1,0 +1,36 @@
+name: Deploy
+
+# Every push to master updates the live server. Can also be run by hand from the Actions tab.
+on:
+  push:
+    branches: [master]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+# Never run two deploys at once; a newer push waits for the current one.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Deploy over SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # The server only lets this key run one fixed command (git pull + ./deploy.sh);
+          # see the command="..." restriction in ~/.ssh/authorized_keys on the server.
+          ssh -T -i ~/.ssh/deploy_key -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o ServerAliveInterval=30 "ubuntu@${DEPLOY_HOST}"

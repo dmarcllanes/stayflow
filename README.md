@@ -26,3 +26,11 @@ Set `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` (any OpenAI-compatible endpoin
 
 Agents never write to the database directly — confirmed actions go through the same validated `db.py`
 functions as the forms (overlap checks, status rules, capacity, dates).
+
+## Auto-deploy
+
+Every push to `master` deploys to the server via `.github/workflows/deploy.yml`: GitHub Actions SSHes in
+with a deploy-only key (repo secrets `DEPLOY_SSH_KEY`, `DEPLOY_HOST`, `DEPLOY_KNOWN_HOSTS`). On the server
+that key is restricted in `~/.ssh/authorized_keys` to one command: `git pull --ff-only && bash deploy.sh`,
+which rebuilds the containers and waits for the health check. Data in `data/` and `.env` are untouched.
+Re-run a deploy from the repo's **Actions** tab, or by hand on the server: `cd ~/stayflow && git pull && ./deploy.sh`.
