@@ -2061,7 +2061,9 @@ def dashboard_body(conn, prop, flash=None, add_values=None, add_error=None, edit
                 P(f"{len(pending)} request{'s' if len(pending) != 1 else ''} waiting"
                   + (f" · {len(arrivals)} arriving today" if arrivals else "") + (f" · {clashes} with clashes" if clashes else ""),
                   cls="mt-1 text-sm text-slate-500")),
-            A(Icon("arrow-right", "h-4 w-4 -rotate-45"), "View storefront", href="/", target="_blank", cls=BTN_GHOST),
+            Div(A(Icon("pencil", "h-4 w-4"), "Edit storefront", href="/admin/storefront", cls=BTN_PRIMARY),
+                A(Icon("arrow-right", "h-4 w-4 -rotate-45"), "View storefront", href="/", target="_blank", cls=BTN_GHOST),
+                cls="flex flex-wrap gap-2"),
             cls="flex flex-wrap items-end justify-between gap-4"),
         Div(Stat("Pending requests", len(pending), "inbox", 1, f"{clashes} clash" + ("es" if clashes != 1 else "") if clashes else "Ready to review"),
             Stat("Upcoming stays", len(upcoming), "calendar", 0, f"{len(arrivals)} arriving today" if arrivals else None),
@@ -2100,7 +2102,7 @@ def admin_header(prop):
                   Span("Owner dashboard", cls="block text-[11px] font-semibold text-slate-400"), cls="min-w-0"),
               href="/admin", cls="flex min-w-0 items-center gap-2.5"),
             Nav(*[A(t, href=h, cls=link) for t, h in (("Queue", "/admin#queue"), ("Upcoming", "/admin#upcoming"),
-                                                         ("Rooms", "/admin#rooms"), ("History", "/admin#history"))],
+                                                         ("Rooms", "/admin#rooms"), ("Storefront", "/admin/storefront"))],
                 cls="hidden items-center gap-0.5 rounded-full bg-stone-100/80 p-1 md:flex"),
             Form(Button(Icon("logout", "h-4 w-4"), Span("Log out", cls="hidden sm:inline"), aria_label="Log out",
                         cls=BTN_GHOST + " !px-3 !py-2"), method="post", action="/admin/logout"),
@@ -2294,6 +2296,255 @@ async def post(req):
         except ValueError as e:
             return admin_respond(req, conn, prop, flash=(str(e), "err"), add_values=values, add_error=str(e))
         return admin_respond(req, conn, prop, flash=(f"{clean['name']} added to your rooms.", "ok"))
+
+
+# --------------------------------------------------------------------------- #
+# Owner storefront editor (/admin/storefront)
+# --------------------------------------------------------------------------- #
+
+SERVICE_ICONS = ("sparkles", "sun", "truck", "cake", "map", "gift", "home", "users", "wallet", "calendar",
+                 "chat", "phone", "camera", "heart", "shield", "globe", "clock", "mail")
+CURRENCIES = ("PHP", "USD", "EUR", "JPY", "KRW", "SGD", "AUD", "GBP")
+
+EDITOR_JS = """
+function sfAddRow(btn){
+  const list=btn.closest('[data-list]'), rows=list.querySelector('[data-rows]'), max=+list.dataset.max||99;
+  if(rows.children.length>=max){ sfToast('Maximum '+max+' items'); return; }
+  rows.append(list.querySelector('template').content.cloneNode(true));
+  const last=rows.lastElementChild; const f=last&&last.querySelector('input,textarea'); if(f) f.focus();
+}
+function sfDelRow(btn){ btn.closest('[data-row]').remove(); }
+function sfPreview(inp){
+  const img=inp.closest('[data-row],[data-photo]').querySelector('img'); if(img && /^https?:\\/\\//.test(inp.value)) img.src=inp.value;
+}
+"""
+
+
+def prop_view(prop) -> dict:
+    """Property row as a plain dict with JSON lists decoded (so the editor can also show unsaved input)."""
+    v = {k: prop[k] for k in prop.keys()}
+    for k in db.PROPERTY_JSON:
+        v[k] = db.json_list(prop, k)
+    return v
+
+
+def _lines(text: str) -> list[str]:
+    return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+
+
+def _zip_rows(form, **cols) -> list[dict]:
+    """Rebuild repeated row inputs (name=svc_title, svc_title, …) into a list of dicts."""
+    lists = {k: form.getlist(name) for k, name in cols.items()}
+    n = max((len(v) for v in lists.values()), default=0)
+    return [{k: (lists[k][i] if i < len(lists[k]) else "") for k in cols} for i in range(n)]
+
+
+def parse_section(section: str, form) -> dict:
+    g = lambda k: form.get(k, "")  # noqa: E731
+    if section == "basics":
+        return {"name": g("name"), "tagline": g("tagline"), "location": g("location"), "about": g("about"),
+                "highlights": _lines(g("highlights"))}
+    if section == "photos":
+        return {"hero_image_url": g("hero_image_url"), "gallery": _zip_rows(form, url="gallery_url", caption="gallery_caption")}
+    if section == "announcements":
+        return {"announcements": _lines(g("announcements"))}
+    if section == "services":
+        return {"services": _zip_rows(form, title="svc_title", description="svc_description", price="svc_price", icon="svc_icon")}
+    if section == "faqs":
+        return {"faqs": _zip_rows(form, q="faq_q", a="faq_a")}
+    if section == "contact":
+        return {k: g(k) for k in ("contact_phone", "contact_email", "facebook_url", "instagram_url", "messenger_url")}
+    if section == "policies":
+        return {k: g(k) for k in ("check_in_time", "check_out_time", "house_rules", "currency", "downpayment_pct",
+                                  "gcash_name", "gcash_number", "bank_name", "bank_account_name", "bank_account_number")}
+    raise KeyError(section)
+
+
+def _hint(text):
+    return P(text, cls="mt-1 text-[11px] text-slate-400")
+
+
+def _row_list(key: str, label: str, add_label: str, rows, render_row, max_items: int):
+    return Div(
+        Div(P(label, cls="text-xs font-semibold text-slate-600"),
+            Span(f"up to {max_items}", cls="text-[11px] text-slate-400"), cls="flex items-baseline justify-between"),
+        Div(*[render_row(r) for r in rows], data_rows="1", cls="mt-2 space-y-2"),
+        Template(render_row({})),
+        Button(Icon("plus", "h-4 w-4"), add_label, type="button", onclick="sfAddRow(this)", cls=BTN_GHOST + " mt-2 !py-2"),
+        data_list=key, data_max=str(max_items),
+    )
+
+
+def _del_btn():
+    return Button(Icon("trash", "h-4 w-4"), type="button", onclick="sfDelRow(this)", aria_label="Remove",
+                  cls="grid h-10 w-10 shrink-0 place-items-center rounded-full text-slate-400 transition hover:bg-rose-50 hover:text-rose-600")
+
+
+def _gallery_row(g):
+    return Div(Img(src=safe_url(g.get("url", "")) or placeholder_img(f"{g.get('caption', '')}-x", 200, 150), alt="",
+                   cls="h-12 w-16 shrink-0 rounded-xl bg-stone-200 object-cover"),
+               Input(name="gallery_url", value=g.get("url", ""), type="url", placeholder="https://… photo link",
+                     oninput="sfPreview(this)", aria_label="Photo URL", cls=INPUT + " min-w-0 flex-[2]"),
+               Input(name="gallery_caption", value=g.get("caption", ""), placeholder="Caption", maxlength="60",
+                     aria_label="Caption", cls=INPUT + " min-w-0 flex-1"),
+               _del_btn(), data_row="1", cls="flex items-center gap-2")
+
+
+def _service_row(s):
+    return Div(
+        Div(Select(*[Option(i.title(), value=i, selected=i == (s.get("icon") or "sparkles")) for i in SERVICE_ICONS],
+                   name="svc_icon", aria_label="Icon", cls=INPUT + " !w-32 shrink-0"),
+            Input(name="svc_title", value=s.get("title", ""), placeholder="Title, e.g. Surf lessons", maxlength="80",
+                  aria_label="Title", cls=INPUT + " min-w-0 flex-1"),
+            _del_btn(), cls="flex items-center gap-2"),
+        Div(Input(name="svc_description", value=s.get("description", ""), placeholder="Short description", maxlength="400",
+                  aria_label="Description", cls=INPUT + " min-w-0 flex-[2]"),
+            Input(name="svc_price", value=s.get("price", ""), placeholder="Price, e.g. ₱800 / person", maxlength="60",
+                  aria_label="Price", cls=INPUT + " min-w-0 flex-1"),
+            cls="mt-2 flex flex-col gap-2 sm:flex-row"),
+        data_row="1", cls="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200/70")
+
+
+def _faq_row(f):
+    return Div(Div(Input(name="faq_q", value=f.get("q", ""), placeholder="Question", maxlength="200", aria_label="Question",
+                         cls=INPUT + " min-w-0 flex-1 font-semibold"), _del_btn(), cls="flex items-center gap-2"),
+               Textarea(f.get("a", ""), name="faq_a", rows="2", placeholder="Answer", maxlength="1000", aria_label="Answer",
+                        cls=INPUT + " mt-2"),
+               data_row="1", cls="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200/70")
+
+
+STOREFRONT_SECTIONS = (
+    ("basics", "Basics & about", "home", 0, "Name, tagline and the story guests read on Home and About."),
+    ("photos", "Photos", "camera", 2, "Hero banner and gallery. Empty slots show placeholder photos."),
+    ("announcements", "Announcement ticker", "sparkles", 1, "The scrolling strip at the very top of every page."),
+    ("services", "Services & add-ons", "gift", 4, "Extras shown on Home and the Services page."),
+    ("faqs", "FAQs", "chat", 3, "Your own questions. Check-in times, payment and house rules are added automatically."),
+    ("contact", "Contact & social", "phone", 5, "How guests reach you. Leave a social link empty to hide it."),
+    ("policies", "Stay policies & payments", "wallet", 1, "Times, rules, downpayment and where guests pay."),
+)
+
+
+def storefront_section_fields(key: str, v: dict):
+    if key == "basics":
+        return (Field("Property name", Input(name="name", value=v["name"], required=True, maxlength="80", cls=INPUT)),
+                Field("Tagline", Input(name="tagline", value=v["tagline"], maxlength="160", placeholder="Sea-breeze rooms a short walk from the beach", cls=INPUT)),
+                Field("Location", Input(name="location", value=v["location"], maxlength="160", cls=INPUT)),
+                Div(Field("About (blank line = new paragraph)", Textarea(v["about"], name="about", rows="6", maxlength="4000", cls=INPUT))),
+                Div(Field("Highlights (one per line)", Textarea("\n".join(v["highlights"]), name="highlights", rows="4", cls=INPUT)),
+                    _hint("Shown as check-marked bullets, e.g. “3-minute walk to the beach”. Up to 12.")))
+    if key == "photos":
+        hero = safe_url(v["hero_image_url"])
+        return (Div(P("Hero banner photo", cls="text-xs font-semibold text-slate-600"),
+                    Div(Img(src=hero or placeholder_img("hero", 600, 300), alt="", cls="h-24 w-40 shrink-0 rounded-2xl bg-stone-200 object-cover"),
+                        Div(Input(name="hero_image_url", value=v["hero_image_url"], type="url", placeholder="https://… (wide photo, 1600px+)",
+                                  oninput="sfPreview(this)", cls=INPUT),
+                            _hint("Paste a link to a hosted photo (Facebook/Google Photos share links won't work — use a direct image link)."),
+                            cls="min-w-0 flex-1"),
+                        data_photo="1", cls="mt-2 flex flex-col gap-3 sm:flex-row sm:items-start")),
+                _row_list("gallery", "Gallery photos", "Add photo", v["gallery"], _gallery_row, 12))
+    if key == "announcements":
+        return (Div(Field("Ticker messages (one per line)", Textarea("\n".join(v["announcements"]), name="announcements", rows="5",
+                                                                     placeholder="🎉 10% off weekday stays this December\nNow accepting GCash & bank transfer",
+                                                                     cls=INPUT)),
+                    _hint("Leave empty to show automatic messages (lowest rate, no booking fees, check-in times, location).")),)
+    if key == "services":
+        return (_row_list("services", "Services", "Add service", v["services"], _service_row, 20),)
+    if key == "faqs":
+        return (_row_list("faqs", "Questions", "Add question", v["faqs"], _faq_row, 30),)
+    if key == "contact":
+        return (Div(Field("Phone / mobile", Input(name="contact_phone", value=v["contact_phone"], type="tel", maxlength="40", cls=INPUT)),
+                    Field("Email", Input(name="contact_email", value=v["contact_email"], type="email", maxlength="120", cls=INPUT)),
+                    cls="grid gap-3 sm:grid-cols-2"),
+                *[Div(Div(BrandBadge(b, "h-10 w-10", "h-5 w-5"),
+                          Input(name=k, value=v[k], type="url", placeholder=f"https://… your {n} link", aria_label=f"{n} link",
+                                cls=INPUT + " min-w-0 flex-1"), cls="flex items-center gap-3"))
+                  for n, k, b in SOCIALS])
+    if key == "policies":
+        cur_opts = CURRENCIES if v["currency"] in CURRENCIES else (v["currency"], *CURRENCIES)
+        return (Div(Field("Check-in time", Input(name="check_in_time", value=v["check_in_time"], type="time", required=True, cls=INPUT)),
+                    Field("Check-out time", Input(name="check_out_time", value=v["check_out_time"], type="time", required=True, cls=INPUT)),
+                    Field("Currency", Select(*[Option(c, value=c, selected=c == v["currency"]) for c in cur_opts], name="currency", cls=INPUT)),
+                    Field("Downpayment %", Input(name="downpayment_pct", value=str(v["downpayment_pct"]), type="number", min="0", max="100",
+                                                 required=True, cls=INPUT)),
+                    cls="grid grid-cols-2 gap-3 lg:grid-cols-4"),
+                Field("House rules", Textarea(v["house_rules"], name="house_rules", rows="3", maxlength="2000", cls=INPUT)),
+                Div(P("GCash", cls="text-xs font-bold uppercase tracking-wider text-slate-400"),
+                    Div(Field("Account name", Input(name="gcash_name", value=v["gcash_name"], maxlength="80", cls=INPUT)),
+                        Field("Number", Input(name="gcash_number", value=v["gcash_number"], maxlength="40", cls=INPUT)),
+                        cls="mt-2 grid gap-3 sm:grid-cols-2"), cls="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200/70"),
+                Div(P("Bank transfer", cls="text-xs font-bold uppercase tracking-wider text-slate-400"),
+                    Div(Field("Bank", Input(name="bank_name", value=v["bank_name"], maxlength="80", placeholder="BPI, BDO…", cls=INPUT)),
+                        Field("Account name", Input(name="bank_account_name", value=v["bank_account_name"], maxlength="80", cls=INPUT)),
+                        Field("Account number", Input(name="bank_account_number", value=v["bank_account_number"], maxlength="60", cls=INPUT)),
+                        cls="mt-2 grid gap-3 sm:grid-cols-3"), cls="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200/70"),
+                _hint("These appear on payment slips and in the FAQ. Leave a method empty to hide it."))
+    raise KeyError(key)
+
+
+def storefront_editor(v: dict, flash=None, error_section: str | None = None, error: str | None = None):
+    nav = Nav(*[A(IconTile(icon, tone, "h-7 w-7", "h-3.5 w-3.5"), Span(title), href=f"#sec-{key}",
+                  cls="flex shrink-0 items-center gap-2 rounded-full px-3 py-1.5 text-sm font-semibold text-slate-600 transition "
+                      "hover:bg-white hover:text-slate-900 lg:rounded-2xl lg:py-2"
+                      + (" bg-white text-rose-700 ring-1 ring-rose-200" if key == error_section else ""))
+                for key, title, icon, tone, _ in STOREFRONT_SECTIONS],
+              cls="sf-noscroll -mx-3 flex gap-1 overflow-x-auto px-3 pb-1 lg:sticky lg:top-24 lg:mx-0 lg:flex-col lg:overflow-visible lg:px-0")
+    sections = []
+    for key, title, icon, tone, sub in STOREFRONT_SECTIONS:
+        err = error if key == error_section else None
+        sections.append(Form(
+            Div(Div(IconTile(icon, tone, "h-10 w-10", "h-5 w-5"),
+                    Div(H2(title, cls="text-lg font-extrabold tracking-tight"), P(sub, cls="text-xs text-slate-500")),
+                    cls="flex items-center gap-3"),
+                cls="flex items-start justify-between gap-3"),
+            P(Icon("x", "h-4 w-4 shrink-0"), err, role="alert",
+              cls="mt-4 flex items-center gap-2 rounded-xl bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700") if err else None,
+            Div(*storefront_section_fields(key, v), cls="mt-5 space-y-4"),
+            Div(Button("Save", Icon("check", "h-4 w-4"), cls=BTN_PRIMARY), cls="mt-5 flex justify-end border-t border-stone-100 pt-4"),
+            id=f"sec-{key}", hx_post=f"/admin/storefront/{key}", hx_target="#sf-editor", hx_swap="outerHTML",
+            method="post", action=f"/admin/storefront/{key}",
+            cls="scroll-mt-28 rounded-[2rem] bg-white p-4 ring-1 ring-stone-200/70 sm:p-6" + (" ring-2 !ring-rose-300" if err else ""),
+        ))
+    return Main(
+        Div(flash_box(flash), cls="sticky top-20 z-30 mb-4") if flash else None,
+        Div(Div(A("← Dashboard", href="/admin", cls="text-xs font-semibold text-slate-500 hover:text-slate-900"),
+                H1("Storefront", cls="mt-1 text-[1.9rem] font-extrabold tracking-tight sm:text-4xl"),
+                P("Everything guests see on your website. Changes go live as soon as you save.", cls="mt-1 text-sm text-slate-500")),
+            A(Icon("arrow-right", "h-4 w-4 -rotate-45"), "View storefront", href="/", target="_blank", cls=BTN_GHOST),
+            cls="flex flex-wrap items-end justify-between gap-4"),
+        Div(Div(nav, cls="min-w-0"), Div(*sections, cls="min-w-0 space-y-6"),
+            cls="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[14rem_minmax(0,1fr)]"),
+        Script(EDITOR_JS),
+        id="sf-editor", cls="mx-auto w-full max-w-6xl flex-1 px-3 pb-24 pt-6 sm:px-4 sm:pt-8",
+    )
+
+
+SECTION_TITLES = {k: t for k, t, *_ in STOREFRONT_SECTIONS}
+
+
+@rt("/admin/storefront")
+def get(req):
+    with db.connect(tenant(req)) as conn:
+        prop = db.get_property(conn)
+    return admin_page(prop, "Storefront", storefront_editor(prop_view(prop)))
+
+
+@rt("/admin/storefront/{section}")
+async def post(req, section: str):
+    if section not in SECTION_TITLES:
+        return Response("Not found", status_code=404)
+    form = await req.form()
+    raw = parse_section(section, form)
+    with db.connect(tenant(req)) as conn:
+        prop = db.get_property(conn)
+        try:
+            db.update_property(conn, db.clean_property(raw))
+        except ValueError as e:
+            v = {**prop_view(prop), **raw}  # keep what the owner typed
+            body = storefront_editor(v, (str(e), "err"), section, str(e))
+        else:
+            prop = db.get_property(conn)
+            body = storefront_editor(prop_view(prop), (f"{SECTION_TITLES[section]} saved — live on your site now.", "ok"))
+    return body if req.headers.get("hx-request") else admin_page(prop, "Storefront", body)
 
 
 @rt("/admin/chat")

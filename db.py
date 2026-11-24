@@ -563,6 +563,107 @@ def delete_room(conn: sqlite3.Connection, room_id: int) -> None:
         conn.execute("DELETE FROM rooms WHERE id=?", (room_id,))
 
 
+# --------------------------------------------------------------------------- #
+# Storefront / property settings (owner-editable)
+# --------------------------------------------------------------------------- #
+
+PROPERTY_EDITABLE = {
+    "name", "tagline", "location", "about", "contact_phone", "contact_email", "check_in_time", "check_out_time",
+    "house_rules", "currency", "downpayment_pct", "gcash_name", "gcash_number", "bank_name", "bank_account_name",
+    "bank_account_number", "hero_image_url", "facebook_url", "instagram_url", "messenger_url",
+    "highlights", "services", "faqs", "gallery", "announcements",
+}
+PROPERTY_JSON = {"highlights", "services", "faqs", "gallery", "announcements"}
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _url(value: str, label: str) -> str:
+    value = (value or "").strip()
+    if value and not value.startswith(("https://", "http://")):
+        raise ValueError(f"{label} must start with https://")
+    return value[:500]
+
+
+def clean_property(fields: dict) -> dict:
+    """Validate owner storefront edits. Only keys present in ``fields`` are cleaned/returned.
+
+    Raises ValueError with an owner-facing message.
+    """
+    out: dict = {}
+    text_limits = {"name": 80, "tagline": 160, "location": 160, "about": 4000, "contact_phone": 40,
+                   "house_rules": 2000, "gcash_name": 80, "gcash_number": 40, "bank_name": 80,
+                   "bank_account_name": 80, "bank_account_number": 60}
+    for k, limit in text_limits.items():
+        if k in fields:
+            out[k] = str(fields[k] or "").strip()[:limit]
+    if "name" in out and not out["name"]:
+        raise ValueError("Property name is required.")
+    if "contact_email" in fields:
+        email = str(fields["contact_email"] or "").strip()
+        if email and not _EMAIL_RE.match(email):
+            raise ValueError("Contact email doesn't look right.")
+        out["contact_email"] = email[:120]
+    for k, label in (("check_in_time", "Check-in time"), ("check_out_time", "Check-out time")):
+        if k in fields:
+            t = str(fields[k] or "").strip()
+            if not _TIME_RE.match(t):
+                raise ValueError(f"{label} must look like 14:00.")
+            out[k] = t
+    if "currency" in fields:
+        cur = str(fields["currency"] or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", cur):
+            raise ValueError("Currency must be a 3-letter code like PHP.")
+        out["currency"] = cur
+    if "downpayment_pct" in fields:
+        try:
+            pct = int(str(fields["downpayment_pct"]).strip())
+        except ValueError:
+            raise ValueError("Downpayment must be a whole number from 0 to 100.")
+        if not 0 <= pct <= 100:
+            raise ValueError("Downpayment must be between 0 and 100%.")
+        out["downpayment_pct"] = pct
+    for k, label in (("hero_image_url", "Hero photo URL"), ("facebook_url", "Facebook link"),
+                     ("instagram_url", "Instagram link"), ("messenger_url", "Messenger link")):
+        if k in fields:
+            out[k] = _url(fields[k], label)
+    # Lists
+    if "highlights" in fields:
+        out["highlights"] = [str(h).strip()[:120] for h in fields["highlights"] if str(h).strip()][:12]
+    if "announcements" in fields:
+        out["announcements"] = [str(a).strip()[:140] for a in fields["announcements"] if str(a).strip()][:10]
+    if "services" in fields:
+        svc = []
+        for s in fields["services"]:
+            title = str(s.get("title", "")).strip()[:80]
+            if not title:
+                continue
+            svc.append({"title": title, "description": str(s.get("description", "")).strip()[:400],
+                        "price": str(s.get("price", "")).strip()[:60], "icon": str(s.get("icon", "")).strip()[:30] or "sparkles"})
+        out["services"] = svc[:20]
+    if "faqs" in fields:
+        out["faqs"] = [{"q": str(f.get("q", "")).strip()[:200], "a": str(f.get("a", "")).strip()[:1000]}
+                       for f in fields["faqs"] if str(f.get("q", "")).strip() and str(f.get("a", "")).strip()][:30]
+    if "gallery" in fields:
+        gal = []
+        for i, g in enumerate(fields["gallery"]):
+            url = _url(g.get("url", ""), f"Gallery photo {i + 1} URL")
+            caption = str(g.get("caption", "")).strip()[:60]
+            if url or caption:
+                gal.append({"url": url, "caption": caption})
+        out["gallery"] = gal[:12]
+    return out
+
+
+def update_property(conn: sqlite3.Connection, fields: dict) -> None:
+    """Write already-cleaned property fields (see clean_property)."""
+    fields = {k: v for k, v in fields.items() if k in PROPERTY_EDITABLE}
+    if not fields:
+        return
+    vals = [json.dumps(v, ensure_ascii=False) if k in PROPERTY_JSON else v for k, v in fields.items()]
+    conn.execute(f"UPDATE property SET {', '.join(f'{k}=?' for k in fields)} WHERE id=1", vals)
+
+
 def add_room(conn: sqlite3.Connection, *, name: str, description: str = "", capacity: int = 2,
              rate_per_night: int = 0, amenities: str = "", image_url: str = "",
              status: str = "available", sort_order: int = 0) -> int:
