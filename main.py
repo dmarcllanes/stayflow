@@ -1597,10 +1597,259 @@ def post(req, room_id: str = "", check_in: str = "", check_out: str = "", guests
         P("The owner will review your request and message you on "
           f"{b['guest_phone']} with payment instructions. Your dates are not held until then.",
           cls="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-900"),
-        Div(A("Back to home", href="/", cls=BTN_GHOST), A("Browse services", href="/services", cls=BTN_GHOST),
-            cls="mt-4 flex flex-wrap gap-2"),
+        Div(P(Icon("sparkles", "mr-1.5 inline h-4 w-4 text-teal-600"), "Your booking page",
+              cls="text-sm font-bold text-slate-900"),
+            P("See your status any time (pending, confirmed, payment details). Save or bookmark this link:",
+              cls="mt-0.5 text-xs text-slate-600"),
+            Div(Input(value=stay_url(req, b), readonly=True, onclick="this.select()", aria_label="Your booking link",
+                      cls=INPUT + " min-w-0 flex-1 !min-h-[2.5rem] !py-1.5 font-mono text-xs"),
+                Button(Icon("document", "h-4 w-4"), Span("Copy"), type="button", data_copy=stay_url(req, b), onclick="sfCopy(this)",
+                       cls=BTN_GHOST + " shrink-0 !px-3 !py-2"),
+                cls="mt-2 flex gap-2"),
+            cls="mt-3 rounded-2xl bg-teal-50/60 p-3.5 ring-1 ring-teal-100"),
+        Div(A(Icon("arrow-right", "h-4 w-4"), "Track my booking", href=stay_path(b), cls=BTN_PRIMARY),
+            A("Back to home", href="/", cls=BTN_GHOST), cls="mt-4 flex flex-wrap gap-2"),
+        Script(STAY_JS),
         id="book", cls=CARD,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Guest booking status page (/stay/<token>): private link, bookmarkable, auto-refreshing
+# --------------------------------------------------------------------------- #
+
+STAY_LINK_DAYS_AFTER_CLOSE = 30  # the link keeps working this long after the booking is finished/declined
+
+
+def stay_path(b) -> str:
+    return f"/stay/{b['access_token']}"
+
+
+def stay_url(req, b) -> str:
+    """Absolute link (for SMS / payment slip text). Behind Caddy, uvicorn's proxy headers make this https."""
+    return str(req.base_url).rstrip("/") + stay_path(b)
+
+
+def stay_state(b, today: str) -> tuple[str, str | None]:
+    """(state, closed_on) where closed_on is the ISO date the booking stopped being active, else None."""
+    st = b["status"]
+    if st == "pending_audit":
+        return ("lapsed", b["check_in"]) if b["check_in"] < today else ("pending", None)
+    if st == "approved":
+        if b["check_out"] <= today:
+            return "completed", b["check_out"]
+        return ("staying", None) if b["check_in"] <= today else ("confirmed", None)
+    closed = (b["decided_at"] or b["created_at"] or today)[:10]
+    return ("declined", closed) if st == "rejected" else ("cancelled", closed)
+
+
+STAY_COPY = {
+    # state: (badge, tone, icon, headline, message)
+    "pending": ("Waiting for the owner", "amber", "clock", "Your request is with the owner",
+                "They'll check the dates and confirm. Your dates aren't held until it's confirmed. This page updates by itself."),
+    "confirmed": ("Confirmed", "green", "check", "Your stay is confirmed! 🎉",
+                  "Send the downpayment below to lock in your dates."),
+    "staying": ("Staying now", "green", "home", "Welcome! Enjoy your stay 🏝️", "Message the owner any time if you need anything."),
+    "completed": ("Completed", "slate", "heart", "Thanks for staying with us!", "We hope to see you again."),
+    "declined": ("Not available", "red", "x", "Sorry, this request wasn't approved",
+                 "The dates may be taken. Try other dates or message us and we'll help."),
+    "cancelled": ("Cancelled", "slate", "x", "This booking was cancelled", "Message us if you have questions, or book new dates."),
+    "lapsed": ("Request expired", "slate", "clock", "This request expired",
+               "The check-in date passed before it was confirmed. Pick new dates to send another request."),
+}
+
+
+# For each state, how each of the 4 steps looks: done / now / fail / todo.
+TRACK = {"pending": "done now todo todo", "confirmed": "done done now todo", "staying": "done done done now",
+         "completed": "done done done done", "declined": "done fail todo todo", "lapsed": "done fail todo todo",
+         "cancelled": "done done fail todo"}
+
+
+def stay_tracker(state: str, b):
+    """Request sent → Owner review → Confirmed → Your stay."""
+    review_sub = {"pending": "In progress", "declined": "Not approved", "lapsed": "Expired"}.get(state, "Approved")
+    confirmed_sub = {"confirmed": "Pay downpayment", "cancelled": "Cancelled"}.get(state, "")
+    steps = [("Request sent", short_date(b["created_at"][:10])), ("Owner review", review_sub),
+             ("Confirmed", confirmed_sub), ("Your stay", short_date(b["check_in"]))]
+    dots = {"done": "bg-emerald-500 text-white", "fail": "bg-rose-500 text-white",
+            "now": "bg-amber-400 text-slate-900 ring-4 ring-amber-100", "todo": "bg-stone-200 text-slate-400"}
+    items = []
+    for i, ((label, sub), how) in enumerate(zip(steps, TRACK[state].split())):
+        mark = Icon("check", "h-3.5 w-3.5") if how == "done" else Icon("x", "h-3.5 w-3.5") if how == "fail" \
+            else Span(str(i + 1), cls="text-[11px] font-bold")
+        items.append(Li(Span(mark, cls=f"grid h-7 w-7 shrink-0 place-items-center rounded-full {dots[how]}"),
+                        Div(P(label, cls="text-xs font-bold " + ("text-slate-400" if how == "todo" else "text-slate-900")),
+                            P(sub, cls="text-[11px] text-slate-500") if sub and how != "todo" else None, cls="min-w-0"),
+                        aria_current="step" if how == "now" else None,
+                        cls="flex min-w-0 flex-1 items-start gap-2 sm:flex-col sm:items-center sm:text-center"))
+    return Ol(*items, aria_label="Booking progress", cls="grid grid-cols-2 gap-4 sm:flex sm:gap-2")
+
+
+def _copy_btn(text: str, label: str = "Copy"):
+    return Button(Icon("document", "h-3.5 w-3.5"), Span(label), type="button", data_copy=text, onclick="sfCopy(this)",
+                  cls="inline-flex shrink-0 items-center gap-1 rounded-full bg-white px-2.5 py-1 text-[11px] font-bold text-slate-700 "
+                      "ring-1 ring-stone-200 hover:bg-stone-50")
+
+
+STAY_JS = """
+function sfCopy(btn, text){
+  const t=text||btn.dataset.copy||'', lbl=btn.querySelector('span')||btn, old=lbl.textContent;
+  const done=()=>{ lbl.textContent='Copied!'; setTimeout(()=>lbl.textContent=old,1600); };
+  if(navigator.clipboard&&window.isSecureContext){ navigator.clipboard.writeText(t).then(done,()=>prompt('Copy this:',t)); }
+  else { prompt('Copy this:', t); }
+}
+function sfShareStay(btn){
+  const url=location.href;
+  if(navigator.share){ navigator.share({title:document.title, url}).catch(()=>{}); } else { sfCopy(btn, url); }
+}
+"""
+
+
+def stay_body(prop, b, room, slug: str, today: str):
+    state, _ = stay_state(b, today)
+    badge, tone, icon, headline, message = STAY_COPY[state]
+    ref = booking_ref(slug, b["id"])
+    balance = b["total_amount"] - b["downpayment_amount"]
+    hero_tone = {"amber": "from-amber-50 to-white ring-amber-200", "green": "from-emerald-50 to-white ring-emerald-200",
+                 "red": "from-rose-50 to-white ring-rose-200", "slate": "from-stone-100 to-white ring-stone-200"}[tone]
+    icon_tone = {"amber": "bg-amber-400 text-slate-900", "green": "bg-emerald-500 text-white",
+                 "red": "bg-rose-500 text-white", "slate": "bg-slate-700 text-white"}[tone]
+    phone = b["guest_phone"]
+    masked = ("•••• " + "".join(c for c in phone if c.isdigit())[-4:]) if phone else ""
+
+    # Payment instructions only once the owner has confirmed (and before the stay ends).
+    pay = None
+    if state == "confirmed":
+        methods = []
+        if prop["gcash_number"]:
+            methods.append(("GCash", prop["gcash_number"], prop["gcash_name"] or prop["name"]))
+        if prop["bank_account_number"]:
+            methods.append((prop["bank_name"] or "Bank transfer", prop["bank_account_number"], prop["bank_account_name"] or prop["name"]))
+        pay = Section(
+            H2("Pay your downpayment", cls="text-lg font-extrabold tracking-tight"),
+            Div(Span("Amount due now", cls="text-sm text-slate-600"),
+                Span(money(prop, b["downpayment_amount"]), cls="text-2xl font-extrabold tracking-tight text-slate-900"),
+                cls="mt-3 flex items-end justify-between gap-3"),
+            P(f"Balance of {money(prop, balance)} is paid on arrival.", cls="text-xs text-slate-500"),
+            Div(*[Div(Div(P(n, cls="text-xs font-bold uppercase tracking-wider text-slate-400"),
+                          P(num, cls="mt-0.5 font-mono text-base font-bold text-slate-900"),
+                          P(acct, cls="text-xs text-slate-500"), cls="min-w-0"),
+                      _copy_btn(num.replace(" ", ""), "Copy number"),
+                      cls="flex items-center justify-between gap-3 rounded-2xl bg-stone-50 p-3.5 ring-1 ring-stone-200/70")
+                  for n, num, acct in methods]
+                or [P("The owner will message you with payment details.", cls="rounded-2xl bg-stone-50 p-3.5 text-sm text-slate-600")],
+                cls="mt-4 space-y-2"),
+            Div(Icon("sparkles", "h-4 w-4 shrink-0"),
+                Span("Put ", Strong(ref), " in the payment note, then send a screenshot of your payment to the owner."),
+                cls="mt-3 flex items-start gap-2 rounded-2xl bg-teal-50 p-3 text-xs font-medium text-teal-900"),
+            cls="rounded-[1.75rem] bg-white p-5 ring-1 ring-stone-200/70 sm:p-6")
+
+    contact = []
+    if prop["contact_phone"]:
+        contact += [A(Icon("phone", "h-4 w-4"), "Call", href=tel_href(prop["contact_phone"]), cls=BTN_GHOST + " !py-2"),
+                    A(Icon("chat", "h-4 w-4"), "Text", href=sms_href(prop["contact_phone"]), cls=BTN_GHOST + " !py-2")]
+    if safe_url(prop["messenger_url"]):
+        contact.append(A(BrandIcon("messenger", "h-4 w-4"), "Messenger", href=prop["messenger_url"], target="_blank",
+                         rel="noopener noreferrer", cls=BTN_GHOST + " !py-2"))
+
+    retry = A(Icon("calendar", "h-4 w-4"), "Book new dates", href=f"/book?room_id={b['room_id']}&guests={b['guests']}", cls=BTN_PRIMARY) \
+        if state in ("declined", "cancelled", "lapsed", "completed") else None
+    live = state in ("pending", "confirmed", "staying")
+
+    return Div(
+        # Status hero
+        Div(Div(Span(Icon(icon, "h-6 w-6"), cls=f"grid h-12 w-12 shrink-0 place-items-center rounded-2xl {icon_tone}"),
+                Div(Badge(badge, tone), H1(headline, cls="mt-2 text-2xl font-extrabold tracking-tight sm:text-3xl"),
+                    P(message, cls="mt-1 text-sm text-slate-600"), cls="min-w-0"),
+                cls="flex items-start gap-4"),
+            Div(stay_tracker(state, b), cls="mt-6 border-t border-stone-200/70 pt-5"),
+            cls=f"rounded-[1.75rem] bg-gradient-to-b p-5 ring-1 sm:p-7 {hero_tone}"),
+        pay,
+        # Stay details
+        Section(
+            Div(Div(room_media(room) if room else None, cls="h-24 w-28 shrink-0 overflow-hidden rounded-2xl bg-stone-200"),
+                Div(P("Booking reference", cls="text-[11px] font-semibold uppercase tracking-wider text-slate-400"),
+                    Div(P(ref, cls="font-mono text-base font-bold"), _copy_btn(ref), cls="flex flex-wrap items-center gap-2"),
+                    P(b["room_name"], cls="mt-1 font-bold text-slate-900"),
+                    P(f"{b['guest_name']} · {masked}", cls="truncate text-xs text-slate-500"), cls="min-w-0"),
+                cls="flex gap-4"),
+            Div(Div(P("Check-in", cls="text-[11px] font-semibold uppercase tracking-wider text-slate-400"),
+                    P(nice_date(b["check_in"]), cls="text-sm font-bold"), P(f"from {prop['check_in_time']}", cls="text-xs text-slate-500")),
+                Div(P("Check-out", cls="text-[11px] font-semibold uppercase tracking-wider text-slate-400"),
+                    P(nice_date(b["check_out"]), cls="text-sm font-bold"), P(f"until {prop['check_out_time']}", cls="text-xs text-slate-500")),
+                cls="mt-4 grid grid-cols-2 gap-3 rounded-2xl bg-stone-50 p-3.5"),
+            Div(_row(f"{money(prop, b['rate_per_night'])} × {b['nights']} night{'s' if b['nights'] != 1 else ''} · "
+                     f"{b['guests']} guest{'s' if b['guests'] != 1 else ''}", money(prop, b["total_amount"])),
+                _row(f"Downpayment ({prop['downpayment_pct']}%)", money(prop, b["downpayment_amount"])),
+                _row("Balance on arrival", money(prop, balance)),
+                Div(_row("Total", money(prop, b["total_amount"]), strong=True), cls="border-t border-stone-200 pt-2"),
+                cls="mt-4 space-y-2 [&_*]:!text-sm"),
+            cls="rounded-[1.75rem] bg-white p-5 ring-1 ring-stone-200/70 sm:p-6"),
+        # Keep this link + contact
+        Section(
+            Div(IconTile("heart", 3, "h-10 w-10", "h-5 w-5"),
+                Div(H2("Save this page", cls="font-extrabold tracking-tight"),
+                    P("Bookmark it or keep the link. It's private to your booking and always shows the latest status, "
+                      f"until {STAY_LINK_DAYS_AFTER_CLOSE} days after your booking ends.", cls="text-xs text-slate-500"),
+                    cls="min-w-0"),
+                cls="flex items-start gap-3"),
+            Div(Button(Icon("arrow-right", "h-4 w-4 -rotate-45"), Span("Share / copy link"), type="button", onclick="sfShareStay(this)",
+                       cls=BTN_PRIMARY + " !py-2"),
+                *contact, retry, cls="mt-4 flex flex-wrap gap-2"),
+            cls="rounded-[1.75rem] bg-white p-5 ring-1 ring-stone-200/70 sm:p-6"),
+        P(f"Last updated {time.strftime('%H:%M')}" + (" · refreshes automatically" if live else ""),
+          cls="text-center text-[11px] text-slate-400"),
+        id="stay", cls="space-y-4",
+        # Live refresh while the booking is active (and immediately when the guest comes back to the tab).
+        **({"hx_get": f"{stay_path(b)}/live", "hx_swap": "outerHTML",
+            "hx_trigger": "every 60s, visibilitychange[document.visibilityState=='visible'] from:document"} if live else {}),
+    )
+
+
+def _stay_lookup(req, token: str):
+    """(prop, booking, room) or None when the link is unknown or has expired."""
+    with db.connect(tenant(req)) as conn:
+        b = db.get_booking_by_token(conn, token)
+        if b is None:
+            return None
+        _, closed_on = stay_state(b, date.today().isoformat())
+        if closed_on and date.fromisoformat(closed_on).toordinal() + STAY_LINK_DAYS_AFTER_CLOSE < date.today().toordinal():
+            return None
+        return db.get_property(conn), b, db.get_room(conn, b["room_id"])
+
+
+PRIVATE = (HttpHeader("X-Robots-Tag", "noindex, nofollow"), HttpHeader("Referrer-Policy", "no-referrer"),
+           HttpHeader("Cache-Control", "no-store"))
+
+
+@rt("/stay/{token}")
+def get(req, token: str):
+    found = _stay_lookup(req, token)
+    with db.connect(tenant(req)) as conn:
+        prop = found[0] if found else db.get_property(conn)
+        rooms = db.list_rooms(conn)
+    if not found:
+        body = Div(empty_state("clock", "This booking link isn't available.",
+                               "It may have expired (links stop working 30 days after a booking ends) or been typed incorrectly. "
+                               "Message us and we'll help."),
+                   A("Back to home", href="/", cls=BTN_GHOST + " mt-4"), cls="flex flex-col items-center")
+        return (site_page(prop, rooms, "Booking status", "", Section(Div(body, cls="mx-auto max-w-xl px-4"), cls="py-12"),
+                          bookbar=False), *PRIVATE)
+    prop, b, room = found
+    return (site_page(prop, rooms, f"Booking {booking_ref(tenant(req), b['id'])}", "",
+                      Section(Div(Eyebrow("Your booking"), Div(stay_body(prop, b, room, tenant(req), date.today().isoformat()), cls="mt-3"),
+                                  cls="mx-auto max-w-2xl px-4"),
+                              Script(STAY_JS), cls="py-8 sm:py-12"),
+                      bookbar=False), *PRIVATE)
+
+
+@rt("/stay/{token}/live")
+def get(req, token: str):
+    found = _stay_lookup(req, token)
+    if not found:
+        return Response(status_code=286)  # htmx: stop polling
+    prop, b, room = found
+    return (stay_body(prop, b, room, tenant(req), date.today().isoformat()), *PRIVATE)
 
 
 # --------------------------------------------------------------------------- #
@@ -1659,11 +1908,14 @@ def card_booking_draft(prop, c):
 
 
 def card_status(prop, c):
-    tone = STATUS_TONE[c["status"]]
-    return Div(Div(P(f"Request #{c['id']}", cls="text-xs font-bold text-slate-500"), Badge(c["status"].replace("_", " "), tone),
+    label, tone = ADMIN_STATUS.get(c["status"], (c["status"], "slate"))
+    label = {"pending_audit": "Waiting for the owner", "rejected": "Not approved"}.get(c["status"], label)
+    return Div(Div(P(f"Request #{c['id']}", cls="text-xs font-bold text-slate-500"), Badge(label, tone),
                    cls="flex items-center justify-between"),
                P(c["room_name"], cls="mt-1 text-sm font-bold"),
                P(f"{short_date(c['check_in'])} → {short_date(c['check_out'])} · {money(prop, c['total_amount'])}", cls="text-xs text-slate-600"),
+               A("Open booking page →", href=f"/stay/{c['token']}", target="_blank",
+                 cls="mt-2 inline-block text-xs font-bold text-teal-700 hover:underline") if c.get("token") else None,
                data_card="status", cls=CARD_WRAP)
 
 
@@ -1737,9 +1989,13 @@ def post(req, sess, aid: str):
         if not ok:
             return result_card(False, "Couldn't send the request", ref)
         b = db.get_booking(conn, bid)
-    return result_card(True, f"Request sent · {ref}",
+    card = result_card(True, f"Request sent · {ref}",
                        f"The owner will review it and message you at {b['guest_phone']} with "
-                       f"{prop['downpayment_pct']}% downpayment instructions. Keep your reference to check the status here.")
+                       f"{prop['downpayment_pct']}% downpayment instructions.")
+    return Div(card, Div(A(Icon("arrow-right", "h-4 w-4"), "Open my booking page", href=stay_path(b), target="_blank",
+                           cls=BTN_ACCENT + " !py-2 text-xs"),
+                         P("Bookmark it to check your status any time.", cls="text-[11px] text-slate-500"),
+                         cls="ml-9 mt-2 flex flex-wrap items-center gap-2"), data_card="result")
 
 
 # --------------------------------------------------------------------------- #
@@ -1917,7 +2173,10 @@ def booking_card(conn, prop, b, today: str, slug: str = ""):
     tag = Badge("Staying now", "green") if in_house else Badge("Arrives today", "teal") if arriving else Badge(label, tone)
     chip = "inline-flex items-center gap-1 rounded-full bg-stone-100 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-stone-200"
     contact = Div(A(Icon("phone", "h-3.5 w-3.5"), "Call", href=tel_href(b["guest_phone"]), cls=chip),
-                  A(Icon("chat", "h-3.5 w-3.5"), "Text", href=sms_href(b["guest_phone"]), cls=chip), cls="flex gap-1.5")
+                  A(Icon("chat", "h-3.5 w-3.5"), "Text", href=sms_href(b["guest_phone"]), cls=chip),
+                  Button(Icon("document", "h-3.5 w-3.5"), Span("Guest link"), type="button", title="Copy the guest's booking status link",
+                         onclick=f"sfCopy(this, location.origin + '{stay_path(b)}')", cls=chip) if b["access_token"] else None,
+                  cls="flex flex-wrap gap-1.5")
     lbl = "text-[11px] font-semibold uppercase tracking-wider text-slate-400"
     return Article(
         Div(tag, Span(booking_ref(slug, b["id"]), title="Booking reference (the guest sees the same one)",
@@ -2282,7 +2541,7 @@ def dashboard_body(conn, prop, flash=None, add_values=None, add_error=None, edit
                           *([card(b) for b in history] or [empty_state("clock", "Nothing here yet.")]),
                           tone=3, grid=True),
             data_panel="history", hidden=True, cls="mt-3"),
-        Script(ADMIN_TABS_JS), Script(PHOTO_JS),
+        Script(ADMIN_TABS_JS), Script(PHOTO_JS), Script(STAY_JS),
         id="admin-main", data_force=force, hx_get="/admin/body", hx_trigger="sf-admin-refresh from:body", hx_swap="outerHTML",
         cls="mx-auto w-full max-w-7xl flex-1 px-3 pb-24 pt-6 sm:px-4 sm:pt-8",
     )
@@ -2361,7 +2620,7 @@ def post(req, bid: int, action: str):
         return admin_respond(req, conn, prop, flash=flash)
 
 
-def slip_text(prop, b, slug: str) -> str:
+def slip_text(prop, b, slug: str, link: str = "") -> str:
     balance = b["total_amount"] - b["downpayment_amount"]
     pay = []
     if prop["gcash_number"]:
@@ -2388,6 +2647,7 @@ def slip_text(prop, b, slug: str) -> str:
         f"Please use reference SF-{slug.upper()}-{b['id']} and send a screenshot of your payment "
         "here to lock in your dates.",
         "",
+        *([f"Your booking page (status & payment details): {link}", ""] if link else []),
         "Salamat po! See you soon. 🏝️",
     ])
 
@@ -2403,7 +2663,7 @@ def get(req, bid: int):
         body = Div(empty_state("document", f"Booking #{bid} is {b['status'].replace('_', ' ')} — slips are only for approved stays."),
                    A("Back to dashboard", href="/admin", cls=BTN_GHOST + " mt-4"))
     else:
-        text = slip_text(prop, b, tenant(req))
+        text = slip_text(prop, b, tenant(req), stay_url(req, b))
         body = Div(
             Pre(text, id="slip", cls="whitespace-pre-wrap rounded-[1.5rem] bg-stone-50 p-5 font-mono text-[13px] leading-relaxed text-slate-800 ring-1 ring-stone-200"),
             Div(Button(Icon("document", "h-4 w-4"), "Copy slip", cls=BTN_PRIMARY + " flex-1 sm:flex-none", type="button",

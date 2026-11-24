@@ -294,7 +294,8 @@ async def guest_reply(conn: sqlite3.Connection, tenant: str, chat_id: str, messa
                "rejected": "Not approved. Try other dates or contact the property.",
                "cancelled": "Cancelled."}[b["status"]]
         cards.append({"type": "status", "id": b["id"], "status": b["status"], "room_name": b["room_name"],
-                      "check_in": b["check_in"], "check_out": b["check_out"], "total_amount": b["total_amount"]})
+                      "check_in": b["check_in"], "check_out": b["check_out"], "total_amount": b["total_amount"],
+                      "token": b["access_token"]})
         return {"reference": f"SF-{tenant.upper()}-{b['id']}", "status": b["status"], "room": b["room_name"],
                 "check_in": b["check_in"], "check_out": b["check_out"], "total": b["total_amount"],
                 "downpayment": b["downpayment_amount"], "next_step": nxt}

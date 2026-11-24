@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS bookings (
                        CHECK (status IN ('pending_audit', 'approved', 'rejected', 'cancelled')),
     created_at         TEXT    NOT NULL DEFAULT (datetime('now')),
     decided_at         TEXT,
+    access_token       TEXT,   -- secret for the guest's /stay/<token> status page
     CHECK (check_out > check_in)
 );
 
@@ -148,6 +149,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for col, ddl in _PROPERTY_MIGRATIONS:
         if have and col not in have:
             conn.execute(f"ALTER TABLE property ADD COLUMN {col} {ddl}")
+    bcols = {r["name"] for r in conn.execute("PRAGMA table_info(bookings)")}
+    if bcols:
+        if "access_token" not in bcols:
+            conn.execute("ALTER TABLE bookings ADD COLUMN access_token TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_token ON bookings(access_token)")
+        # Give older bookings a guest status link too.
+        for (bid,) in conn.execute("SELECT id FROM bookings WHERE access_token IS NULL").fetchall():
+            conn.execute("UPDATE bookings SET access_token=? WHERE id=?", (new_access_token(), bid))
 
 
 @contextmanager
@@ -366,6 +375,24 @@ def validate_booking_request(conn: sqlite3.Connection, *, room_id: int, guest_na
                 total_amount=total, downpayment_amount=down)
 
 
+def new_access_token() -> str:
+    """Unguessable key for a guest's booking status link (128 bits)."""
+    return secrets.token_urlsafe(16)
+
+
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def get_booking_by_token(conn: sqlite3.Connection, token: str) -> sqlite3.Row | None:
+    if not token or not _TOKEN_RE.match(token):
+        return None
+    return conn.execute(
+        """SELECT b.*, r.name AS room_name FROM bookings b
+           JOIN rooms r ON r.id = b.room_id WHERE b.access_token = ?""",
+        (token,),
+    ).fetchone()
+
+
 def create_booking_request(conn: sqlite3.Connection, *, room_id: int, guest_name: str,
                            guest_phone: str, guest_email: str, guests: int,
                            check_in: str, check_out: str, notes: str) -> int:
@@ -376,12 +403,12 @@ def create_booking_request(conn: sqlite3.Connection, *, room_id: int, guest_name
         cur = conn.execute(
             """INSERT INTO bookings (room_id, guest_name, guest_phone, guest_email, guests,
                    check_in, check_out, notes, nights, rate_per_night, total_amount,
-                   downpayment_amount, status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending_audit')""",
+                   downpayment_amount, status, access_token)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending_audit',?)""",
             (v["room_id"], str(guest_name).strip()[:120], str(guest_phone).strip()[:40],
              str(guest_email or "").strip()[:120], v["guests"], v["check_in"], v["check_out"],
              str(notes or "").strip()[:1000], v["nights"], v["rate_per_night"], v["total_amount"],
-             v["downpayment_amount"]),
+             v["downpayment_amount"], new_access_token()),
         )
         return cur.lastrowid
 
