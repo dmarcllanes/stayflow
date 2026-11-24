@@ -24,13 +24,38 @@ import os
 import secrets
 import time
 from datetime import date
+from pathlib import Path
 from urllib.parse import quote as urlquote
 
 from fasthtml.common import *  # noqa: F403  (FT components, fast_app, serve, ...)
 from starlette.responses import PlainTextResponse, RedirectResponse, Response
 
-import ai
-import db
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE lines from .env so `uv run main.py` works without --env-file.
+
+    Real environment variables (Docker env_file, shell exports) always win.
+    """
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key, val = key.strip(), val.strip()
+        if val[:1] in "\"'" and val[-1:] == val[:1] and len(val) >= 2:
+            val = val[1:-1]
+        else:
+            val = val.split(" #", 1)[0].strip()  # allow trailing comments like .env.example has
+        os.environ.setdefault(key, val)
+
+
+_load_dotenv(Path(__file__).with_name(".env"))
+
+import ai  # noqa: E402  (after .env so the AI client sees LLM_* settings)
+import db  # noqa: E402
 
 BASE_DOMAIN = os.environ.get("BASE_DOMAIN", "").lower().strip(".")
 DEFAULT_TENANT = os.environ.get("DEFAULT_TENANT", "").lower()
