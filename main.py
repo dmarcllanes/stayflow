@@ -18,6 +18,7 @@ or $DEFAULT_TENANT for bare hosts such as localhost.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import secrets
@@ -1741,6 +1742,12 @@ def _too_many_attempts(key) -> bool:
     return len(hits) >= _LOGIN_MAX
 
 
+def _master_password_ok(password: str) -> bool:
+    """ADMIN_PASSWORD from the environment (.env) also unlocks the dashboard. Ignored if unset or < 8 chars."""
+    master = os.environ.get("ADMIN_PASSWORD", "")
+    return len(master) >= 8 and hmac.compare_digest(password.encode(), master.encode())
+
+
 def login_page(prop, error: str | None = None):
     return page(
         f"Owner login · {prop['name']}",
@@ -1786,7 +1793,7 @@ def post(req, sess, password: str = ""):
         prop = db.get_property(conn)
     if _too_many_attempts(key):
         return login_page(prop, "Too many attempts. Try again in 15 minutes.")
-    if not db.verify_password(password, prop["admin_password_hash"]):
+    if not (_master_password_ok(password) or db.verify_password(password, prop["admin_password_hash"])):
         _login_failures.setdefault(key, []).append(time.monotonic())
         return login_page(prop, "Wrong password.")
     _login_failures.pop(key, None)
