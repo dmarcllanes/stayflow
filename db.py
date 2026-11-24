@@ -17,7 +17,7 @@ import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -368,37 +368,143 @@ def create_booking_request(conn: sqlite3.Connection, *, room_id: int, guest_name
         return cur.lastrowid
 
 
+# Allowed status changes: action -> (required current status, new status).
+TRANSITIONS = {
+    "approve": ("pending_audit", "approved"),
+    "reject": ("pending_audit", "rejected"),
+    "cancel": ("approved", "cancelled"),
+    "reopen": ("rejected", "pending_audit"),  # undo a reject; the request goes back to the queue
+}
+
+
+class TransitionError(ValueError):
+    """An owner action that isn't allowed from the booking's current state."""
+
+
 def approve_booking(conn: sqlite3.Connection, booking_id: int) -> list[sqlite3.Row]:
-    """Approve if no approved booking overlaps. Returns the conflicting rows (empty on success)."""
+    """Approve a pending request if no approved stay overlaps.
+
+    Returns the conflicting rows (empty on success). Raises LookupError / TransitionError.
+    """
     with transaction(conn):
         b = conn.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,)).fetchone()
         if b is None:
             raise LookupError("booking not found")
-        if b["status"] == "approved":
-            return []
+        if b["status"] != "pending_audit":
+            raise TransitionError(f"Booking #{booking_id} is {b['status'].replace('_', ' ')}; only pending requests can be approved.")
+        if b["check_in"] < date.today().isoformat():
+            raise TransitionError(f"Booking #{booking_id} has a check-in date in the past. Reject it or ask the guest for new dates.")
+        room = get_room(conn, b["room_id"])
+        if room is None or room["status"] == "hidden":
+            raise TransitionError(f"The room for booking #{booking_id} is no longer listed.")
         conflicts = find_overlaps(conn, b["room_id"], b["check_in"], b["check_out"],
                                   exclude_booking_id=booking_id)
         if conflicts:
             return conflicts
-        conn.execute("UPDATE bookings SET status='approved', decided_at=datetime('now') WHERE id=?",
-                     (booking_id,))
+        conn.execute("UPDATE bookings SET status='approved', decided_at=datetime('now') "
+                     "WHERE id=? AND status='pending_audit'", (booking_id,))
         return []
 
 
-def set_booking_status(conn: sqlite3.Connection, booking_id: int, status: str) -> None:
-    if status not in ("rejected", "cancelled", "pending_audit"):
+def transition_booking(conn: sqlite3.Connection, booking_id: int, action: str) -> sqlite3.Row:
+    """Apply a non-approve action (reject / cancel / reopen) guarded by the current status."""
+    if action == "approve":
         raise ValueError("use approve_booking() to approve")
-    conn.execute("UPDATE bookings SET status=?, decided_at=datetime('now') WHERE id=?",
-                 (status, booking_id))
+    if action not in TRANSITIONS:
+        raise ValueError(f"unknown action: {action}")
+    need, new = TRANSITIONS[action]
+    with transaction(conn):
+        b = conn.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,)).fetchone()
+        if b is None:
+            raise LookupError("booking not found")
+        if b["status"] != need:
+            raise TransitionError(f"Can't {action} booking #{booking_id}: it is {b['status'].replace('_', ' ')}.")
+        conn.execute("UPDATE bookings SET status=?, decided_at=? WHERE id=? AND status=?",
+                     (new, None if new == "pending_audit" else _now(), booking_id, need))
+    return get_booking(conn, booking_id)
 
 
-def update_room(conn: sqlite3.Connection, room_id: int, *, rate_per_night: int, status: str) -> None:
+def _now() -> str:
+    """UTC timestamp in the same format as SQLite's datetime('now')."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def set_booking_status(conn: sqlite3.Connection, booking_id: int, status: str) -> None:
+    """Back-compat wrapper (seed/ops scripts). Prefer transition_booking()."""
+    action = {"rejected": "reject", "cancelled": "cancel", "pending_audit": "reopen"}.get(status)
+    if action is None:
+        raise ValueError("use approve_booking() to approve")
+    transition_booking(conn, booking_id, action)
+
+
+def recent_decisions(conn: sqlite3.Connection, limit: int = 15) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT b.*, r.name AS room_name FROM bookings b JOIN rooms r ON r.id = b.room_id
+           WHERE b.status IN ('rejected', 'cancelled')
+              OR (b.status = 'approved' AND b.check_out < date('now'))
+           ORDER BY COALESCE(b.decided_at, b.created_at) DESC LIMIT ?""", (limit,)).fetchall()
+
+
+def booking_counts(conn: sqlite3.Connection, room_id: int) -> int:
+    return conn.execute("SELECT COUNT(*) FROM bookings WHERE room_id=?", (room_id,)).fetchone()[0]
+
+
+# --------------------------------------------------------------------------- #
+# Rooms
+# --------------------------------------------------------------------------- #
+
+def clean_room(*, name: str, rate_per_night, capacity, description: str = "", amenities: str = "",
+               image_url: str = "", status: str = "available", sort_order=0) -> dict:
+    """Validate owner room input. Raises ValueError with an owner-facing message."""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Room name is required.")
+    try:
+        rate = int(str(rate_per_night).replace(",", "").strip())
+    except ValueError:
+        raise ValueError("Rate must be a whole number, e.g. 2500.")
+    if rate < 0:
+        raise ValueError("Rate can't be negative.")
+    try:
+        cap = int(str(capacity).strip())
+    except ValueError:
+        raise ValueError("Max guests must be a whole number.")
+    if not 1 <= cap <= 50:
+        raise ValueError("Max guests must be between 1 and 50.")
     if status not in ROOM_STATUSES:
+        raise ValueError("Pick a valid status.")
+    image_url = (image_url or "").strip()
+    if image_url and not image_url.startswith(("https://", "http://")):
+        raise ValueError("Image URL must start with https://")
+    try:
+        order = int(str(sort_order or 0).strip())
+    except ValueError:
+        order = 0
+    amen = ", ".join(a.strip() for a in (amenities or "").split(",") if a.strip())
+    return dict(name=name[:80], rate_per_night=rate, capacity=cap, description=(description or "").strip()[:1000],
+                amenities=amen[:300], image_url=image_url[:500], status=status, sort_order=order)
+
+
+def update_room(conn: sqlite3.Connection, room_id: int, **fields) -> None:
+    """Update any subset of room columns (already validated by clean_room or the quick form)."""
+    allowed = {"name", "description", "capacity", "rate_per_night", "amenities", "image_url", "status", "sort_order"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if "status" in fields and fields["status"] not in ROOM_STATUSES:
         raise ValueError("bad room status")
-    if rate_per_night < 0:
+    if "rate_per_night" in fields and int(fields["rate_per_night"]) < 0:
         raise ValueError("rate must be >= 0")
-    conn.execute("UPDATE rooms SET rate_per_night=?, status=? WHERE id=?",
-                 (rate_per_night, status, room_id))
+    if not fields:
+        return
+    sets = ", ".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE rooms SET {sets} WHERE id=?", (*fields.values(), room_id))
+
+
+def delete_room(conn: sqlite3.Connection, room_id: int) -> None:
+    """Delete a room with no booking history; otherwise the owner should hide it."""
+    with transaction(conn):
+        if booking_counts(conn, room_id):
+            raise ValueError("This room has bookings on record. Set it to “hidden” instead of deleting it.")
+        conn.execute("DELETE FROM rooms WHERE id=?", (room_id,))
 
 
 def add_room(conn: sqlite3.Connection, *, name: str, description: str = "", capacity: int = 2,
